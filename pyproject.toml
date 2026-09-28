@@ -1,0 +1,36 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "deployx"
+version = "0.1.0"
+description = "Production-Grade Deployment Manager for Ubuntu Linux servers with Docker & Docker Compose"
+readme = "README.md"
+requires-python = ">=3.12"
+license = "MIT"
+authors = [
+    { name = "DeployX Core Team" },
+]
+dependencies = [
+    "typer>=0.12.0",
+    "pydantic>=2.7.0",
+    "pyyaml>=6.0.1",
+    "rich>=13.7.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-mock>=3.14.0",
+]
+
+[project.scripts]
+deployx = "deployx.cli:app"
+
+[tool.hatch.build.targets.wheel]
+packages = ["deployx"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
