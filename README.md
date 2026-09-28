@@ -49,17 +49,17 @@
 ## 🛠️ Automated Installation (Ubuntu 22.04 / 24.04 LTS)
 
 ### One-Line Production Installer
-Run the production installer with `sudo`:
+Run the official production bootstrap installer with `sudo`:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/your-org/deployx/main/scripts/install.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/HimanDelbina/deployx/main/install.sh | sudo bash
 ```
 
-Or from a local clone:
+### Or Install from Local Clone:
 
 ```bash
-git clone https://github.com/your-org/deployx.git /tmp/deployx
-cd /tmp/deployx
+git clone https://github.com/HimanDelbina/deployx.git
+cd deployx
 sudo bash scripts/install.sh
 ```
 
@@ -85,7 +85,7 @@ deployx doctor
 
 **Diagnostic checks include:**
 - Operating System & Ubuntu version (22.04 / 24.04)
-- Python runtime (`>= 3.12`)
+- Python runtime (`>= 3.10`)
 - Git version & binary availability
 - SSH client (`OpenSSH`)
 - Docker CLI & Compose v2 plugin

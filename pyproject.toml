@@ -7,7 +7,7 @@ name = "deployx"
 version = "0.1.0"
 description = "Production-Grade Deployment Manager for Ubuntu Linux servers with Docker & Docker Compose"
 readme = "README.md"
-requires-python = ">=3.12"
+requires-python = ">=3.10"
 license = "MIT"
 authors = [
     { name = "DeployX Core Team" },

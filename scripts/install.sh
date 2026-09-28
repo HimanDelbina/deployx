@@ -158,17 +158,18 @@ fi
 log_info "Upgrading pip and installing DeployX..."
 "${VENV_DIR}/bin/pip" install --upgrade pip setuptools wheel
 
-# Install DeployX: if running from repo source directory, install editable or package
+# Install DeployX: strictly from checked-out repository source
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(dirname "$SCRIPT_DIR")"
 
-if [[ -f "${REPO_ROOT}/pyproject.toml" ]]; then
-    log_info "Installing DeployX from local source directory ${REPO_ROOT}..."
-    "${VENV_DIR}/bin/pip" install "${REPO_ROOT}"
-else
-    log_info "Installing DeployX core package..."
-    "${VENV_DIR}/bin/pip" install deployx
+if [[ ! -f "${REPO_ROOT}/pyproject.toml" ]]; then
+    log_error "DeployX source manifest not found at ${REPO_ROOT}/pyproject.toml"
+    log_error "scripts/install.sh must be executed from a valid checked-out DeployX repository."
+    exit 1
 fi
+
+log_info "Installing DeployX from local source directory: ${REPO_ROOT}..."
+"${VENV_DIR}/bin/pip" install "${REPO_ROOT}"
 
 # 9. Create global executable symlink
 log_info "Linking /usr/local/bin/deployx..."

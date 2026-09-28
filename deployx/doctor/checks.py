@@ -102,22 +102,22 @@ def check_ubuntu_version() -> DoctorItem:
 
 
 def check_python_version() -> DoctorItem:
-    """Verifies Python is version 3.12 or higher."""
+    """Verifies Python is version 3.10 or higher."""
     major, minor, micro = sys.version_info[:3]
     version_str = f"{major}.{minor}.{micro}"
-    if (major, minor) >= (3, 12):
+    if (major, minor) >= (3, 10):
         return DoctorItem(
             category="Runtime",
             name="Python Version",
             status=CheckStatus.OK,
-            details=f"Python {version_str} (>= 3.12)",
+            details=f"Python {version_str} (>= 3.10)",
         )
     return DoctorItem(
         category="Runtime",
         name="Python Version",
         status=CheckStatus.ERROR,
         details=f"Python {version_str} detected",
-        recommendation="Upgrade to Python 3.12 or higher: sudo apt install python3.12 python3.12-venv",
+        recommendation="Upgrade to Python 3.10 or higher: sudo apt install python3 python3-venv",
     )
 
 
