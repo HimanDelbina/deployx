@@ -50,10 +50,12 @@ source /etc/os-release
 if [[ "$ID" != "ubuntu" ]]; then
     log_warn "Detected OS '$NAME' is not Ubuntu. DeployX is designed for Ubuntu 22.04 / 24.04 LTS."
 else
-    if [[ "$VERSION_ID" != "22.04" && "$VERSION_ID" != "24.04" ]]; then
-        log_warn "Ubuntu version $VERSION_ID detected. Recommended versions: 22.04 LTS (Jammy) or 24.04 LTS (Noble)."
-    else
+    if [[ "$VERSION_ID" == "22.04" || "$VERSION_ID" == "24.04" ]]; then
         log_info "Verified supported operating system: $PRETTY_NAME"
+    else
+        log_warn "Ubuntu $VERSION_ID detected."
+        log_warn "DeployX has not yet been formally validated on this version."
+        log_warn "Continuing in compatibility mode."
     fi
 fi
 
@@ -155,8 +157,47 @@ if [[ ! -d "$VENV_DIR" ]]; then
     python3 -m venv "$VENV_DIR"
 fi
 
-log_info "Upgrading pip and installing DeployX..."
-"${VENV_DIR}/bin/pip" install --upgrade pip setuptools wheel
+# Configure PIP timeouts and preserve custom mirror
+PIP_INDEX_URL="${PIP_INDEX_URL:-}"
+if [[ -n "$PIP_INDEX_URL" ]]; then
+    log_info "Preserving user-specified package index: ${PIP_INDEX_URL}"
+    export PIP_INDEX_URL
+fi
+export PIP_DEFAULT_TIMEOUT="${PIP_DEFAULT_TIMEOUT:-15}"
+export PIP_RETRIES="${PIP_RETRIES:-2}"
+
+# Preflight connectivity check
+TARGET_INDEX="${PIP_INDEX_URL:-https://pypi.org/simple/}"
+log_info "Running package index connectivity preflight (${TARGET_INDEX})..."
+if ! curl -fsSL -m 8 -o /dev/null "$TARGET_INDEX" 2>/dev/null; then
+    log_warn "Python package index is unreachable."
+    echo ""
+    echo -e "${YELLOW}Current index:${NC}"
+    echo "  ${TARGET_INDEX}"
+    echo ""
+    echo -e "${YELLOW}You can retry with a custom mirror:${NC}"
+    echo "  sudo env \\"
+    echo "    PIP_INDEX_URL=https://<your-mirror>/simple/ \\"
+    echo "    bash scripts/install.sh"
+    echo ""
+    log_error "DeployX installation could not connect to Python package index."
+    echo "Possible causes:"
+    echo "- DNS resolution failure"
+    echo "- restricted outbound HTTPS"
+    echo "- package index blocked by network policy"
+    echo ""
+    exit 1
+fi
+
+# Do not force pip upgrade by default; only upgrade if explicitly instructed
+if [[ "${DEPLOYX_UPGRADE_PIP:-0}" == "1" ]]; then
+    log_info "DEPLOYX_UPGRADE_PIP=1 set: Upgrading pip, setuptools, wheel..."
+    "${VENV_DIR}/bin/pip" install --upgrade pip setuptools wheel || {
+        log_warn "Failed to upgrade pip; proceeding with existing venv tools."
+    }
+else
+    log_info "Preserving existing pip in virtual environment (set DEPLOYX_UPGRADE_PIP=1 to force upgrade)."
+fi
 
 # Install DeployX: strictly from checked-out repository source
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -169,7 +210,23 @@ if [[ ! -f "${REPO_ROOT}/pyproject.toml" ]]; then
 fi
 
 log_info "Installing DeployX from local source directory: ${REPO_ROOT}..."
-"${VENV_DIR}/bin/pip" install "${REPO_ROOT}"
+if ! "${VENV_DIR}/bin/pip" install "${REPO_ROOT}"; then
+    echo ""
+    log_error "DeployX installation could not download Python dependencies."
+    echo ""
+    echo "Possible causes:"
+    echo "- DNS resolution failure"
+    echo "- restricted outbound HTTPS"
+    echo "- package index blocked by network policy"
+    echo ""
+    echo "Current PIP_INDEX_URL:"
+    echo "  ${TARGET_INDEX}"
+    echo ""
+    echo "Retry example:"
+    echo "  sudo env PIP_INDEX_URL=https://<mirror>/simple/ bash scripts/install.sh"
+    echo ""
+    exit 1
+fi
 
 # 9. Create global executable symlink
 log_info "Linking /usr/local/bin/deployx..."

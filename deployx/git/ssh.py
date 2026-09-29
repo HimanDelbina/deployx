@@ -40,6 +40,7 @@ def create_deploy_key(
 ) -> Path:
     """
     Generates a dedicated ED25519 SSH deploy key for the project.
+    Validates project configuration before key creation.
     Permissions:
     - /opt/deployx/keys: 0700
     - Private key: 0600
@@ -47,6 +48,23 @@ def create_deploy_key(
     """
     valid_name = validate_project_name(project_name)
     ensure_directory(paths.keys_dir, mode=0o700)
+
+    # Validate project configuration before key creation if project exists
+    from deployx.deployment.project import load_project_config, project_exists
+    from deployx.core.security import validate_git_url, SecurityError
+
+    if project_exists(valid_name):
+        try:
+            cfg = load_project_config(valid_name)
+            validate_git_url(cfg.git.repository, check_placeholders=True)
+        except (SecurityError, ValueError) as exc:
+            msg = (
+                "Project repository configuration is invalid.\n"
+                "Fix the repository URL before creating a deploy key."
+            )
+            if console:
+                console.print(f"[bold red]{msg}[/bold red]")
+            raise ValueError(msg) from exc
 
     key_path = paths.get_project_key_path(valid_name)
     pub_path = paths.get_project_pubkey_path(valid_name)
@@ -60,8 +78,14 @@ def create_deploy_key(
             console.print(f"[bold yellow]Warning:[/bold yellow] {msg}")
         return key_path
 
-    if key_path.exists():
+    if key_path.exists() and force:
+        if console:
+            console.print(
+                f"[bold yellow]Warning:[/bold yellow] Overwriting existing deploy key for '{valid_name}' with --force.\n"
+                "This will invalidate existing GitHub deploy key access until updated."
+            )
         key_path.unlink(missing_ok=True)
+
     if pub_path.exists():
         pub_path.unlink(missing_ok=True)
 
@@ -137,14 +161,17 @@ def show_deploy_key(project_name: str, console: Optional[Console] = None) -> str
 
 def verify_deploy_key(project_name: str, console: Optional[Console] = None) -> bool:
     """
-    Verifies that the SSH deploy key has authenticated read access to the GitHub repo.
-    Uses 'git ls-remote <repo> HEAD' with GIT_SSH_COMMAND to test access without cloning.
+    Verifies that the SSH deploy key has authenticated read access to the GitHub repo,
+    confirms repository existence, branch existence, and resolves remote commit SHA.
+    Updates config to verified: true on success.
     """
     from deployx.deployment.project import load_project_config
+    from deployx.core.filesystem import atomic_write_file
 
     valid_name = validate_project_name(project_name)
     cfg = load_project_config(valid_name)
     repo_url = cfg.git.repository
+    branch = cfg.git.branch
 
     key_path = paths.get_project_key_path(valid_name)
     if not key_path.is_file():
@@ -158,30 +185,61 @@ def verify_deploy_key(project_name: str, console: Optional[Console] = None) -> b
 
     if console:
         console.print(f"[cyan]Testing SSH deploy key access to remote repository...[/cyan]")
-        console.print(f"[dim]Repository: {repo_url}[/dim]")
+        console.print(f"[dim]Repository: {repo_url} (branch: {branch})[/dim]")
 
-    cmd = ["git", "ls-remote", repo_url, "HEAD"]
+    cmd_branch = ["git", "ls-remote", repo_url, f"refs/heads/{branch}"]
     try:
-        res = run_command(cmd, env=test_env, timeout=30)
+        res = run_command(cmd_branch, env=test_env, timeout=30)
         output = res.stdout.strip()
-        if output:
-            remote_sha = output.split()[0]
-            if console:
-                console.print(
-                    Panel(
-                        f"[bold green]Deploy key verified successfully![/bold green]\n\n"
-                        f"[bold]Remote Repository:[/bold] {repo_url}\n"
-                        f"[bold]Remote HEAD Commit:[/bold] {remote_sha}\n"
-                        f"[bold]Access Status:[/bold]      Authenticated & Read-Ready",
-                        title="Key Verification Success",
-                        border_style="green",
+        remote_sha = None
+        for line in output.splitlines():
+            parts = line.split()
+            if len(parts) >= 2 and (parts[1] == f"refs/heads/{branch}" or parts[1].endswith(f"/{branch}")):
+                remote_sha = parts[0]
+                break
+
+        if not remote_sha:
+            # Check if repository exists via HEAD to distinguish branch error vs repo error
+            cmd_head = ["git", "ls-remote", repo_url, "HEAD"]
+            res_head = run_command(cmd_head, env=test_env, timeout=15)
+            if res_head.success and res_head.stdout.strip():
+                if console:
+                    console.print(
+                        Panel(
+                            f"[bold red]Key verification failed:[/bold red]\n\n"
+                            f"Branch '{branch}' was not found in the remote repository.\n\n"
+                            f"[bold yellow]Troubleshooting:[/bold yellow]\n"
+                            f"Verify that branch '{branch}' exists on GitHub or update it with:\n"
+                            f"[bold cyan]deployx project edit {valid_name} --branch <branch>[/bold cyan]",
+                            title="Branch Not Found",
+                            border_style="red",
+                        )
                     )
+                return False
+            else:
+                if console:
+                    console.print("[bold yellow]Verification inconclusive: Remote returned empty response.[/bold yellow]")
+                return False
+
+        # Mark verified in config
+        cfg.git.verified = True
+        config_path = paths.get_project_config_path(valid_name)
+        atomic_write_file(config_path, cfg.to_yaml(), mode=0o640)
+
+        short_commit = remote_sha[:7]
+        if console:
+            console.print(
+                Panel(
+                    f"[bold green]GitHub access verified.[/bold green]\n\n"
+                    f"[bold]Repository:[/bold]    {repo_url}\n"
+                    f"[bold]Branch:[/bold]        {branch}\n"
+                    f"[bold]Remote commit:[/bold] {short_commit}",
+                    title="Key Verification Success",
+                    border_style="green",
                 )
-            return True
-        else:
-            if console:
-                console.print("[bold yellow]Verification inconclusive: Remote returned empty response.[/bold yellow]")
-            return False
+            )
+        return True
+
     except CommandError as exc:
         if console:
             console.print(
@@ -190,7 +248,7 @@ def verify_deploy_key(project_name: str, console: Optional[Console] = None) -> b
                     f"{exc}\n\n"
                     f"[bold yellow]Troubleshooting:[/bold yellow]\n"
                     f"1. Make sure you copied the public key using: [bold cyan]deployx key show {valid_name}[/bold cyan]\n"
-                    "2. Check that the key is registered in your GitHub repository Deploy Keys.\n"
+                    "2. Check that the key is registered in your GitHub repository Deploy Keys (Settings -> Deploy keys).\n"
                     "3. Ensure the repository URL in deployx.yml is accurate.",
                     title="Key Verification Failed",
                     border_style="red",

@@ -76,6 +76,7 @@ def project_add(
     domain: Optional[str] = typer.Option(None, "--domain", "-d", help="Domain name"),
     framework: str = typer.Option("django", "--framework", "-f", help="Target framework"),
     database: str = typer.Option("postgres", "--database", help="Database preference (postgres/sqlite/mysql/none)"),
+    non_interactive: bool = typer.Option(False, "--non-interactive", help="Disable interactive prompts"),
 ):
     """
     Register a new project into DeployX.
@@ -86,6 +87,46 @@ def project_add(
         git=git,
         branch=branch,
         private=private,
+        domain=domain,
+        framework=framework,
+        database=database,
+        non_interactive=non_interactive,
+        console=console,
+    )
+
+
+@project_app.command("remove")
+def project_remove(
+    project: str = typer.Argument(..., help="Project name to remove"),
+    purge: bool = typer.Option(False, "--purge", help="Also remove deploy keys and Docker resources"),
+    force: bool = typer.Option(False, "--force", "-f", help="Skip confirmation prompt"),
+):
+    """
+    Safely remove a registered project and its configuration.
+    """
+    from deployx.deployment.project import remove_project
+    success = remove_project(project_name=project, purge=purge, force=force, console=console)
+    if not success:
+        raise typer.Exit(1)
+
+
+@project_app.command("edit")
+def project_edit(
+    project: str = typer.Argument(..., help="Project name to edit"),
+    git: Optional[str] = typer.Option(None, "--git", "-g", help="New Git repository URL"),
+    branch: Optional[str] = typer.Option(None, "--branch", "-b", help="New Git branch"),
+    domain: Optional[str] = typer.Option(None, "--domain", "-d", help="New custom domain"),
+    framework: Optional[str] = typer.Option(None, "--framework", "-f", help="New framework"),
+    database: Optional[str] = typer.Option(None, "--database", help="New database preference"),
+):
+    """
+    Edit configuration of an existing project.
+    """
+    from deployx.deployment.project import edit_project
+    edit_project(
+        project_name=project,
+        git=git,
+        branch=branch,
         domain=domain,
         framework=framework,
         database=database,

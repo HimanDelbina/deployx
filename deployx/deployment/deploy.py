@@ -60,8 +60,21 @@ def run_deployment(
             console.print("[1/12] [cyan]Running preflight checks...[/cyan]")
         config: ProjectConfig = load_project_config(valid_name)
 
-        # Check SSH key if private
+        # Check SSH key and verification state if private
         if config.git.private:
+            if not getattr(config.git, "verified", False):
+                msg = (
+                    "Private repository access has not been verified.\n\n"
+                    "Run:\n"
+                    f"deployx key create {valid_name}\n"
+                    f"deployx key show {valid_name}\n"
+                    f"deployx key verify {valid_name}"
+                )
+                if console:
+                    console.print(f"[bold red]{msg}[/bold red]")
+                logger.error(msg)
+                return False
+
             key_path = paths.get_project_key_path(valid_name)
             if not key_path.is_file():
                 raise CommandError(

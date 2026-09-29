@@ -19,13 +19,14 @@ from deployx.state import get_state_manager
 
 
 @pytest.fixture(autouse=True)
-def isolated_deployx(tmp_path, monkeypatch):
+def isolated_deployx(tmp_path, monkeypatch, mocker):
     root = tmp_path / "opt_deployx"
     etc = tmp_path / "etc_deployx"
     monkeypatch.setenv("DEPLOYX_ROOT", str(root))
     monkeypatch.setenv("DEPLOYX_CONFIG_DIR", str(etc))
     reload_paths()
     paths.ensure_all_dirs()
+    mocker.patch("deployx.deployment.project.verify_public_repository", return_value="f0222384a29ebcd90d80111bfbc7c1abf8da4e0f")
     yield
 
 
@@ -34,7 +35,7 @@ def test_deployment_pipeline_success(mocker):
     console = Console(record=True)
     add_project(
         name="store-app",
-        git="https://github.com/example/store.git",
+        git="https://github.com/acme-org/store.git",
         branch="main",
         private=False,
         domain="store.example.com",
@@ -90,7 +91,7 @@ def test_update_already_up_to_date(mocker):
     console = Console(record=True)
     add_project(
         name="web-blog",
-        git="https://github.com/example/blog.git",
+        git="https://github.com/acme-org/blog.git",
         branch="main",
         private=False,
         domain=None,
@@ -101,7 +102,7 @@ def test_update_already_up_to_date(mocker):
 
     # Set state as already on commit 4ba128c
     state_mgr = get_state_manager()
-    initial_state = DeploymentState.new("web-blog", "https://github.com/example/blog.git", "main")
+    initial_state = DeploymentState.new("web-blog", "https://github.com/acme-org/blog.git", "main")
     initial_state.current_commit = "4ba128c704f056d61f1cf01bfbc7c1abf8da4e0f"
     initial_state.status = DeploymentStatus.HEALTHY
     state_mgr.save_state(initial_state)
@@ -124,7 +125,7 @@ def test_update_triggers_new_deployment(mocker):
     console = Console(record=True)
     add_project(
         name="web-news",
-        git="https://github.com/example/news.git",
+        git="https://github.com/acme-org/news.git",
         branch="main",
         private=False,
         domain=None,
@@ -135,7 +136,7 @@ def test_update_triggers_new_deployment(mocker):
 
     # State has old commit
     state_mgr = get_state_manager()
-    old_state = DeploymentState.new("web-news", "https://github.com/example/news.git", "main")
+    old_state = DeploymentState.new("web-news", "https://github.com/acme-org/news.git", "main")
     old_state.current_commit = "f0222384a29ebcd90d80111bfbc7c1abf8da4e0f"
     state_mgr.save_state(old_state)
 

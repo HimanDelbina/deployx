@@ -1,20 +1,35 @@
-# DeployX (v0.1)
+# DeployX (v0.1.1)
 
 > **Production-Grade Autonomous Deployment Manager for Ubuntu Linux servers (22.04 / 24.04 LTS).**  
-> Effortlessly register, deploy, and incrementally update public and private GitHub projects using Docker and Docker Compose v2 with zero host bloat.
+> Effortlessly register, verify, deploy, and incrementally update public and private GitHub projects using Docker and Docker Compose v2 with zero host bloat.
 
 ---
 
 ## 🚀 Key Highlights & Philosophy
 
-- **Production-Ready by Design**: Engineered strictly for bare-metal / VPS Ubuntu Linux (22.04 & 24.04 LTS).
+- **Production-Ready & Hardened**: Engineered specifically for bare-metal / VPS Ubuntu Linux. Officially validated on **Ubuntu 22.04 LTS** and **24.04 LTS**, with automated compatibility mode for newer releases (such as Ubuntu 26.04).
 - **Zero Host Python Dependencies**: Application dependencies run exclusively inside isolated Docker containers. No pollution of host system packages.
-- **SSH Deploy Keys per Project**: Cryptographically generated ED25519 deploy keys stored with strict `0600` permissions. Never exposes or logs private keys.
+- **Strict Registration Validation**: Prevents invalid configurations upfront. Detects and rejects placeholder URLs (e.g. `REAL_REPOSITORY`, `USER`, `example.com`), verifies public repositories before saving, and enforces deploy key verification before private deployments.
+- **SSH Deploy Keys per Project**: Cryptographically generated ED25519 deploy keys stored with strict `0600` permissions. Existing keys are protected from accidental overwrite unless `--force` is specified. Never exposes or logs private keys.
+- **Safe Lifecycle Management**: Supports non-destructive project removal (`deployx project remove`) with optional `--purge`, configuration edits (`deployx project edit`), and non-interactive scripting (`--non-interactive`).
+- **Network & Mirror Friendly**: Fully supports custom package mirrors via `PIP_INDEX_URL`, includes preflight network diagnostics, preserves system DNS configurations untouched, and avoids forced pip upgrades.
 - **Existing Configuration Protection**: Respects and validates existing repository `Dockerfile`, `docker-compose.yml`, and `.env.example`. DeployX writes non-intrusive auxiliary files (e.g. `docker-compose.deployx.yml`) so your Git tree is never dirtied or overwritten.
 - **Zero Insecure Defaults**: High-entropy cryptographic secrets generated automatically using Python's `secrets` module (`SECRET_KEY`, `POSTGRES_PASSWORD`).
 - **Strict Version Tracking**: Docker images are automatically tagged with Git commit SHAs (`myproject:4ba128c`), laying the foundation for instant rollbacks and deterministic state reproduction.
 - **Automated Update Intelligence**: `deployx update` inspects remote repository HEADs before building, preventing unnecessary rebuilds if the codebase is already up to date.
 - **Robust Security Perimeter**: All subprocesses run with `shell=False`, strict argument arrays, regex-enforced project and URL sanitization, path traversal prevention, and automated secret redaction across all logs.
+
+---
+
+## 🖥️ Operating System Compatibility Matrix
+
+| Operating System | Support Level | Status | Notes |
+| :--- | :--- | :--- | :--- |
+| **Ubuntu 24.04 LTS** (Noble Numbat) | **Validated** | Supported | Recommended production tier |
+| **Ubuntu 22.04 LTS** (Jammy Jellyfish) | **Validated** | Supported | Fully tested LTS release |
+| **Ubuntu 26.04+** | **Compatibility Mode** | Supported with Warning | Automatically executes in compatibility mode with an advisory warning |
+| **Debian 12+** | Experimental | Community | Docker Engine & Compose v2 required |
+| Non-Debian / RHEL / Alpine | Unsupported | Untested | Not supported by automated installer |
 
 ---
 
@@ -46,7 +61,7 @@
 
 ---
 
-## 🛠️ Automated Installation (Ubuntu 22.04 / 24.04 LTS)
+## 🛠️ Automated Installation
 
 ### One-Line Production Installer
 Run the official production bootstrap installer with `sudo`:
@@ -55,43 +70,57 @@ Run the official production bootstrap installer with `sudo`:
 curl -fsSL https://raw.githubusercontent.com/HimanDelbina/deployx/main/install.sh | sudo bash
 ```
 
+### Installation with Custom Mirror / Restricted Network
+If operating behind an enterprise proxy or in a restricted network with an internal PyPI mirror, pass `PIP_INDEX_URL`:
+
+```bash
+# Example with a hypothetical mirror:
+curl -fsSL https://raw.githubusercontent.com/HimanDelbina/deployx/main/install.sh | sudo env PIP_INDEX_URL=https://mirror.example.com/simple/ bash
+```
+
 ### Or Install from Local Clone:
 
 ```bash
 git clone https://github.com/HimanDelbina/deployx.git
 cd deployx
 sudo bash scripts/install.sh
+
+# With custom mirror:
+sudo env PIP_INDEX_URL=https://mirror.example.com/simple/ bash scripts/install.sh
 ```
 
-### What the installer does (Idempotent):
-1. Verifies Ubuntu 22.04 or 24.04 LTS.
-2. Installs core dependencies (`curl`, `ca-certificates`, `git`, `openssh-client`, `python3-venv`).
-3. Configures the official Docker repository with secure GPG keyrings.
-4. Installs Docker Engine and Docker Compose v2 plugin (`docker compose`).
-5. Configures `/opt/deployx/` and `/etc/deployx/` with strict security permissions.
-6. Provisions an isolated Python virtual environment at `/opt/deployx/venv`.
-7. Installs the `deployx` CLI and links `/usr/local/bin/deployx`.
-8. Executes `deployx doctor` to verify system readiness.
+### What the installer does (Idempotent & Safe):
+1. **Compatibility Check**: Validates Ubuntu release (officially supported on 22.04 and 24.04 LTS; runs in compatibility mode with an advisory warning on newer releases like 26.04).
+2. **Preflight Network Diagnostics**: Checks connectivity to GitHub and PyPI/mirror. If connectivity fails, outputs actionable mirror and firewall hints without aborting blindly.
+3. **DNS Protection**: **Never** modifies `/etc/resolv.conf`, `systemd-resolved`, or Netplan. All network settings remain untouched.
+4. **Installs System Dependencies**: Installs core packages (`curl`, `ca-certificates`, `git`, `openssh-client`, `python3-venv`).
+5. **Configures Docker Engine**: Sets up the official Docker repository with secure GPG keyrings and installs Docker Engine with the Compose v2 plugin (`docker compose`).
+6. **Isolated Python Venv**: Provisions a virtual environment at `/opt/deployx/venv`. Honors `PIP_INDEX_URL` and preserves the distribution's stable `pip` without forcing an upgrade (upgrade can be enabled via `DEPLOYX_UPGRADE_PIP=1`).
+7. **Security Permissions**: Configures `/opt/deployx/` and `/etc/deployx/` with strict least-privilege permissions.
+8. **Installs CLI**: Installs `deployx` and symlinks `/usr/local/bin/deployx`.
+9. **Automated Diagnostic**: Executes `deployx doctor` to verify system readiness.
 
 ---
 
 ## 🩺 System Diagnostic: `deployx doctor`
 
-Run the diagnostic suite at any time to verify system health:
+Run the diagnostic suite at any time to verify system health, Docker state, and network connectivity:
 
 ```bash
 deployx doctor
 ```
 
 **Diagnostic checks include:**
-- Operating System & Ubuntu version (22.04 / 24.04)
-- Python runtime (`>= 3.10`)
-- Git version & binary availability
-- SSH client (`OpenSSH`)
-- Docker CLI & Compose v2 plugin
-- Docker daemon socket connectivity & engine version
-- Root disk space availability (requires `>= 2 GB`, recommends `>= 5 GB`)
-- DeployX directory presence and filesystem writability
+- **Operating System**: Ubuntu version compatibility (22.04 / 24.04 LTS validated; compatibility mode on newer versions).
+- **Python Runtime**: Python 3.10+ runtime check.
+- **Git & OpenSSH**: Availability and binary versions.
+- **Docker Engine & Compose**: Docker daemon socket connectivity, engine version, and Compose v2 plugin.
+- **Disk Space**: Root partition availability (requires `>= 2 GB`, recommends `>= 5 GB`).
+- **Filesystem Permissions**: Verification of `/opt/deployx` hierarchy and write permissions.
+- **Network & DNS Diagnostics**:
+  - DNS resolution of `github.com` (with strict 2-second timeout to prevent hangs).
+  - GitHub HTTPS & SSH reachability.
+  - Package index reachability (checks official PyPI or custom `PIP_INDEX_URL` configured on the system).
 
 Outputs clear `[ OK ]`, `[ WARN ]`, and `[ ERROR ]` badges alongside actionable recovery instructions.
 
@@ -101,15 +130,22 @@ Outputs clear `[ OK ]`, `[ WARN ]`, and `[ ERROR ]` badges alongside actionable 
 
 ### 1. Deploying a Public GitHub Repository
 
+DeployX automatically detects placeholders, checks remote connectivity via `git ls-remote`, and verifies that the specified branch exists before saving the project.
+
 #### Step A: Register the project
 ```bash
 deployx project add \
   --name my-django-app \
-  --git https://github.com/example/my-django-app.git \
+  --git https://github.com/myorg/my-django-app.git \
   --branch main \
   --framework django \
   --database postgres
 ```
+
+> **Non-Interactive Mode**: For automated scripts or CI/CD pipelines, pass `--non-interactive` to bypass interactive prompts:
+> ```bash
+> deployx project add --name my-django-app --git https://github.com/myorg/my-django-app.git --non-interactive
+> ```
 
 #### Step B: Trigger the deployment
 ```bash
@@ -122,7 +158,12 @@ DeployX will clone the repository, detect dependencies, generate missing configs
 
 ### 2. Deploying a Private GitHub Repository
 
-For private repositories, DeployX uses a dedicated, isolated ED25519 SSH deploy key.
+For private repositories, DeployX enforces a secure verification workflow to ensure authentication succeeds before any deployment is attempted.
+
+```
+[project add --private]  ──>  [key create]  ──>  [Add key to GitHub]  ──>  [key verify]  ──>  [deploy]
+   (verified: false)                                                        (verified: true)
+```
 
 #### Step A: Register the private project
 ```bash
@@ -132,12 +173,14 @@ deployx project add \
   --branch main \
   --private
 ```
+*The project is registered with `verified: false`. Deployments are safely guarded until access is verified.*
 
 #### Step B: Generate the dedicated SSH Deploy Key
 ```bash
 deployx key create client-portal
 ```
-*Creates `/opt/deployx/keys/client-portal` (private, `0600`) and `/opt/deployx/keys/client-portal.pub` (public).*
+*Creates `/opt/deployx/keys/client-portal` (private, `0600`) and `/opt/deployx/keys/client-portal.pub` (public).*  
+*If a key already exists, DeployX prevents accidental overwriting unless `--force` is passed.*
 
 #### Step C: Display and copy the public key
 ```bash
@@ -155,11 +198,57 @@ deployx key show client-portal
 ```bash
 deployx key verify client-portal
 ```
-*Tests remote authentication and resolves the latest remote commit SHA.*
+*Tests remote authentication via SSH, verifies that the configured branch exists, retrieves the latest remote commit SHA, and marks the project as verified (`git.verified = true`).*
 
 #### Step F: Deploy
 ```bash
 deployx deploy client-portal
+```
+*If a user attempts to deploy an unverified private project, DeployX blocks execution and provides immediate instructions to create and verify the deploy key.*
+
+---
+
+## 🛠️ Project Management Commands
+
+### List Projects
+```bash
+deployx project list
+```
+Displays registered projects, framework, branch, latest deployed commit, health status, and repository verification status (`Verified: yes / no`). Long repository URLs are gracefully formatted for clean terminal display.
+
+### Inspect Project Details
+```bash
+deployx project info <project>
+```
+Displays full project configuration, directory paths, environment state, and whether the repository and deploy key are verified.
+
+### Edit Project Configuration
+Update project parameters without manually editing files. DeployX re-validates all fields and re-verifies public repository connectivity:
+```bash
+deployx project edit my-django-app --branch staging --port 8080 --domain staging.example.com
+```
+
+Supported edit flags:
+- `--git <url>`: Update repository URL (re-validated and placeholder-checked).
+- `--branch <branch>`: Change deployment branch.
+- `--domain <domain>`: Update domain name.
+- `--port <port>`: Change external host port mapping.
+- `--database <postgres|sqlite|mysql|none>`: Change database backend.
+- `--redis / --no-redis`: Toggle Redis container.
+- `--worker / --no-worker`: Toggle background Celery/RQ worker.
+
+### Safe Project Removal
+Safely remove a project from DeployX registration:
+```bash
+# Non-destructive metadata removal (preserves containers, volumes, and deploy keys):
+deployx project remove my-django-app
+
+# Complete purge (stops & removes containers, deletes volumes and SSH keys):
+deployx project remove my-django-app --purge
+
+# Force removal without interactive confirmation prompt (for scripts):
+deployx project remove my-django-app --force
+deployx project remove my-django-app --purge --force
 ```
 
 ---
@@ -192,19 +281,26 @@ deployx update my-django-app
 
 ---
 
-## 📊 Monitoring & Lifecycle Commands
+## 📊 Command Reference
 
 | Command | Purpose |
 | :--- | :--- |
-| `deployx project list` | Lists all registered projects, frameworks, branches, commits, and statuses |
+| `deployx project add` | Registers a new project with placeholder detection & verification |
+| `deployx project list` | Lists all registered projects with branch, commit, and verification status |
 | `deployx project info <project>` | Displays complete project metadata, paths, and deployment state |
+| `deployx project edit <project>` | Safely updates project configuration parameters with re-validation |
+| `deployx project remove <project>` | Removes project metadata safely; supports `--purge` and `--force` |
+| `deployx key create <project>` | Generates dedicated ED25519 deploy key (preserves existing unless `--force`) |
+| `deployx key show <project>` | Displays public SSH deploy key |
+| `deployx key verify <project>` | Tests SSH authentication against remote repository & verifies branch |
+| `deployx deploy <project>` | Builds, provisions, and deploys the project |
+| `deployx update <project>` | Performs zero-drift, SHA-checked incremental update |
 | `deployx status <project>` | Inspects live container statuses and healthcheck state |
 | `deployx logs <project>` | Views streaming or tailed Docker container logs (`--tail 100`, `--follow`) |
 | `deployx restart <project>` | Restarts project containers safely |
 | `deployx stop <project>` | Stops running containers |
 | `deployx start <project>` | Starts stopped containers |
-| `deployx key show <project>` | Displays public SSH deploy key |
-| `deployx key verify <project>` | Tests SSH authentication against remote repository |
+| `deployx doctor` | Runs full system, Docker, permission, and network diagnostics |
 
 ---
 
@@ -220,6 +316,7 @@ git:
   repository: git@github.com:myorg/store-portal.git
   branch: main
   private: true
+  verified: true        # Automatically maintained by DeployX
 deployment:
   framework: django
   domain: portal.example.com
@@ -242,12 +339,15 @@ deployment:
 
 ## 🔒 Security Architecture
 
-1. **Subprocess Isolation**: All OS calls use `run_command` with explicit string lists and `shell=False`. Prevents command injection attacks.
-2. **Path Traversal Guards**: Project names, branches, and custom paths are resolved and strictly validated against directory traversal (`..`, absolute path overrides).
-3. **Secret Masking & Redaction**: The core logging engine redacts all SSH private keys, `SECRET_KEY`, `POSTGRES_PASSWORD`, and sensitive variable patterns before writing to disk or terminal.
-4. **Dedicated Per-Project Keys**: No single shared SSH key across repositories; each project has its own ED25519 keypair.
-5. **No Host Dependency Leaks**: Python libraries, Gunicorn, psycopg2, etc. are installed inside Docker images, preserving the stability of the Ubuntu host.
-6. **Isolated Docker Networks & Volumes**: Each project resides on `deployx_<project>_net` with named volumes `deployx_<project>_pgdata` and `deployx_<project>_static`. Projects cannot interfere with one another.
+1. **Placeholder & Input Validation**: Strict validation rejects placeholder names, example domains, and invalid git URLs before any action is taken.
+2. **Subprocess Isolation**: All OS calls use `run_command` with explicit string lists and `shell=False`. Prevents command injection attacks.
+3. **Path Traversal Guards**: Project names, branches, and custom paths are resolved and strictly validated against directory traversal (`..`, absolute path overrides).
+4. **Secret Masking & Redaction**: The core logging engine redacts all SSH private keys, `SECRET_KEY`, `POSTGRES_PASSWORD`, and sensitive variable patterns before writing to disk or terminal.
+5. **Dedicated Per-Project Keys**: No single shared SSH key across repositories; each project has its own ED25519 keypair.
+6. **Key Overwrite Protection**: `deployx key create` refuses to overwrite an existing key unless `--force` is explicitly provided.
+7. **No Host Dependency Leaks**: Python libraries, Gunicorn, psycopg2, etc. are installed inside Docker images, preserving the stability of the Ubuntu host.
+8. **Isolated Docker Networks & Volumes**: Each project resides on `deployx_<project>_net` with named volumes `deployx_<project>_pgdata` and `deployx_<project>_static`. Projects cannot interfere with one another.
+9. **DNS Configuration Integrity**: The installer and CLI never alter system DNS resolvers or systemd-resolved.
 
 ---
 
@@ -255,11 +355,14 @@ deployment:
 
 | Problem | Root Cause | Actionable Fix |
 | :--- | :--- | :--- |
+| `Repository is not verified` | Private repository was registered but key was not verified | Run `deployx key create <project>`, add public key to GitHub, then run `deployx key verify <project>`. |
+| `Git URL contains placeholder values` | URL includes `REAL_REPOSITORY`, `USER`, `REPO`, or `example.com` | Provide your real GitHub repository URL (e.g. `https://github.com/myorg/myapp.git`). |
+| `Public repository verification failed` | Repository does not exist, is private, or network is down | Check spelling, ensure the repo is public (or use `--private`), or check internet connectivity. |
 | `Git authentication failed (publickey)` | SSH key missing or not added to GitHub | Run `deployx key show <project>`, copy public key to GitHub repository -> Settings -> Deploy keys, then run `deployx key verify <project>`. |
+| `PyPI / mirror connection failed` | Restricted network or custom mirror unreachable | Pass `PIP_INDEX_URL` during installation, e.g. `sudo env PIP_INDEX_URL=https://mirror.example.com/simple/ bash scripts/install.sh`. |
 | `Docker daemon is not running` | Docker service inactive | Start the Docker service with `sudo systemctl start docker`. |
-| `Port is already allocated` | Another service is using port 8000 | Check listening ports with `sudo ss -tulpn` and assign a distinct port in `deployx.yml`. |
+| `Port is already allocated` | Another service is using port 8000 | Check listening ports with `sudo ss -tulpn` and assign a distinct port using `deployx project edit <project> --port <new_port>`. |
 | `Healthcheck failed or timed out` | Application crashed on startup or wrong health path | Inspect container logs with `deployx logs <project>` or adjust healthcheck path in `deployx.yml`. |
-| `Deploy key verification failed` | Host key verification or wrong repo URL | Check repository URL in `deployx.yml` and verify GitHub host key with `ssh-keyscan github.com >> ~/.ssh/known_hosts`. |
 
 ---
 
@@ -270,3 +373,4 @@ deployment:
 - **v0.4**: Web Dashboard UI with real-time SSE deployment log streaming.
 - **v0.5**: Automated database backups and S3 snapshots.
 - **v0.6**: Multi-Server cluster management.
+

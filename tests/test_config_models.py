@@ -23,7 +23,7 @@ def test_project_config_valid():
         version=1,
         project=ProjectMeta(name="myproject"),
         git=GitConfig(
-            repository="git@github.com:example/myproject.git",
+            repository="git@github.com:acme-corp/myproject.git",
             branch="main",
             private=True,
         ),

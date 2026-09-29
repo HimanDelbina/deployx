@@ -42,7 +42,7 @@ def test_generate_production_env(tmp_path):
     cfg = ProjectConfig(
         version=1,
         project=ProjectMeta(name=pname),
-        git=GitConfig(repository="https://github.com/example/repo.git"),
+        git=GitConfig(repository="https://github.com/acme-org/mybackend.git"),
         deployment=DeploymentConfig(
             framework=FrameworkType.DJANGO,
             database=DatabasePreference.POSTGRES,
@@ -76,7 +76,7 @@ def test_generate_compose_and_dockerfile(tmp_path):
     cfg = ProjectConfig(
         version=1,
         project=ProjectMeta(name=pname),
-        git=GitConfig(repository="https://github.com/example/web.git"),
+        git=GitConfig(repository="https://github.com/acme-org/web.git"),
         deployment=DeploymentConfig(
             framework=FrameworkType.DJANGO,
             database=DatabasePreference.POSTGRES,

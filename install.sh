@@ -36,6 +36,15 @@ if [[ ! -f /etc/os-release ]]; then
     exit 1
 fi
 
+source /etc/os-release
+if [[ "$ID" != "ubuntu" ]]; then
+    echo -e "${YELLOW}[DeployX Bootstrap WARNING]${NC} Detected OS '$NAME' is not Ubuntu. DeployX is designed for Ubuntu 22.04 / 24.04 LTS."
+else
+    if [[ "$VERSION_ID" != "22.04" && "$VERSION_ID" != "24.04" ]]; then
+        echo -e "${YELLOW}[DeployX Bootstrap WARNING]${NC} Ubuntu $VERSION_ID detected. DeployX has not yet been formally validated on this version. Continuing in compatibility mode."
+    fi
+fi
+
 # 3. Resolve and validate target version / branch
 DEPLOYX_VERSION="${DEPLOYX_VERSION:-main}"
 if [[ ! "$DEPLOYX_VERSION" =~ ^[a-zA-Z0-9._/-]+$ ]]; then
@@ -85,4 +94,5 @@ if [[ ! -f "$INTERNAL_INSTALLER" ]]; then
 fi
 
 log_info "Launching DeployX system installation..."
+export PIP_INDEX_URL="${PIP_INDEX_URL:-}"
 bash "$INTERNAL_INSTALLER"

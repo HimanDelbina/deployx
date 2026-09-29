@@ -17,13 +17,14 @@ runner = CliRunner()
 
 
 @pytest.fixture(autouse=True)
-def isolated_deployx(tmp_path, monkeypatch):
+def isolated_deployx(tmp_path, monkeypatch, mocker):
     root = tmp_path / "opt_deployx"
     etc = tmp_path / "etc_deployx"
     monkeypatch.setenv("DEPLOYX_ROOT", str(root))
     monkeypatch.setenv("DEPLOYX_CONFIG_DIR", str(etc))
     reload_paths()
     paths.ensure_all_dirs()
+    mocker.patch("deployx.deployment.project.verify_public_repository", return_value="f0222384a29ebcd90d80111bfbc7c1abf8da4e0f")
     yield
 
 
@@ -32,7 +33,7 @@ def test_cli_status(mocker):
     from rich.console import Console
     add_project(
         name="status-app",
-        git="https://github.com/example/status.git",
+        git="https://github.com/acme-org/status.git",
         branch="main",
         private=False,
         domain=None,
@@ -42,7 +43,7 @@ def test_cli_status(mocker):
     )
 
     # Save state
-    state = DeploymentState.new("status-app", "https://github.com/example/status.git", "main")
+    state = DeploymentState.new("status-app", "https://github.com/acme-org/status.git", "main")
     state.status = DeploymentStatus.HEALTHY
     state.health_status = HealthStatus.HEALTHY
     state.current_commit = "f0222384a29ebcd90d80111bfbc7c1abf8da4e0f"
@@ -71,7 +72,7 @@ def test_cli_lifecycle_commands(mocker):
     from rich.console import Console
     add_project(
         name="ctrl-app",
-        git="https://github.com/example/ctrl.git",
+        git="https://github.com/acme-org/ctrl.git",
         branch="main",
         private=False,
         domain=None,
@@ -105,7 +106,7 @@ def test_cli_logs(mocker):
     from rich.console import Console
     add_project(
         name="log-app",
-        git="https://github.com/example/log.git",
+        git="https://github.com/acme-org/log.git",
         branch="main",
         private=False,
         domain=None,

@@ -39,6 +39,78 @@ SECRET_ASSIGNMENT_REGEX = re.compile(
 )
 
 
+# Placeholder patterns and forbidden template values
+PLACEHOLDER_KEYWORDS = [
+    "username",
+    "user",
+    "owner",
+    "repository",
+    "repo",
+    "real_repository",
+    "real-repository",
+    "your_repository",
+    "your-repository",
+    "example",
+    "example.com",
+    "your-org",
+    "your_org",
+    "your-user",
+    "your_user",
+]
+
+
+def detect_git_url_placeholders(url: str) -> list[str]:
+    """
+    Detects obvious placeholder tokens in Git URLs (case-insensitive).
+    Returns a list of matched placeholder tokens.
+    """
+    if not url:
+        return []
+
+    clean_url = url.strip()
+    detected: list[str] = []
+
+    # Strip protocol prefix
+    stripped = clean_url
+    for prefix in ("git@", "ssh://", "https://", "http://"):
+        if stripped.lower().startswith(prefix):
+            stripped = stripped[len(prefix):]
+            break
+
+    # Split host and path
+    if ":" in stripped and not stripped.startswith("http"):
+        host, _, path = stripped.partition(":")
+    else:
+        parts = stripped.split("/", 1)
+        host = parts[0]
+        path = parts[1] if len(parts) > 1 else ""
+
+    # Check host for placeholder domains
+    host_clean = host.split("@")[-1].lower()
+    if host_clean == "example.com" or host_clean.endswith(".example.com"):
+        if "example.com" not in [d.lower() for d in detected]:
+            detected.append("example.com")
+    elif host_clean == "example":
+        if "example" not in [d.lower() for d in detected]:
+            detected.append("example")
+
+    # Split path into components
+    path_tokens = [seg for seg in re.split(r"[/:]", path) if seg]
+    for seg in path_tokens:
+        seg_clean = re.sub(r"\.git$", "", seg, flags=re.IGNORECASE)
+        seg_lower = seg_clean.lower()
+        seg_norm = seg_lower.replace("-", "_")
+
+        for kw in PLACEHOLDER_KEYWORDS:
+            kw_norm = kw.replace("-", "_")
+            if seg_lower == kw or seg_norm == kw_norm:
+                if seg_clean not in detected:
+                    detected.append(seg_clean)
+                break
+
+    return detected
+
+
 def validate_project_name(name: str) -> str:
     """
     Validates project name against safe naming rules:
@@ -46,6 +118,7 @@ def validate_project_name(name: str) -> str:
     - Must start with an alphanumeric character
     - May contain alphanumeric characters, underscores, and hyphens
     - Prevents command injection and path traversal
+    - Rejects obvious placeholder names
     """
     if not isinstance(name, str):
         raise SecurityError("Project name must be a string.")
@@ -64,15 +137,23 @@ def validate_project_name(name: str) -> str:
     if clean_name in {".", "..", "root", "default", "system"}:
         raise SecurityError(f"Project name '{name}' is reserved and cannot be used.")
     
+    # Check for placeholder names
+    clean_lower = clean_name.lower().replace("-", "_")
+    if clean_lower in {kw.replace("-", "_") for kw in PLACEHOLDER_KEYWORDS}:
+        raise SecurityError(
+            f"Project name '{name}' appears to be a placeholder value. Provide a real project name."
+        )
+    
     return clean_name
 
 
-def validate_git_url(url: str) -> str:
+def validate_git_url(url: str, check_placeholders: bool = True) -> str:
     """
     Validates Git repository URL:
     - Rejects strings starting with '-' to block CLI argument injection.
     - Rejects dangerous schemes like file://, ext::, fd::.
     - Requires standard SSH or HTTPS Git URLs.
+    - Rejects obvious placeholder tokens (case-insensitive).
     """
     if not isinstance(url, str):
         raise SecurityError("Git URL must be a string.")
@@ -96,6 +177,14 @@ def validate_git_url(url: str) -> str:
             f"Invalid Git URL format: '{clean_url}'. Must be valid SSH (e.g. git@github.com:user/repo.git) "
             "or HTTPS (e.g. https://github.com/user/repo.git)."
         )
+    
+    if check_placeholders:
+        placeholders = detect_git_url_placeholders(clean_url)
+        if placeholders:
+            ph_list = "\n".join(placeholders)
+            raise SecurityError(
+                f"Repository URL appears to contain placeholder values:\n{ph_list}\n\nProvide a real Git repository URL."
+            )
     
     return clean_url
 

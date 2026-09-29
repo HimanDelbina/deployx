@@ -61,6 +61,7 @@ class GitConfig(BaseModel):
     repository: str
     branch: str = "main"
     private: bool = False
+    verified: bool = False
 
     @field_validator("repository")
     @classmethod

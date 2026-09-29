@@ -6,13 +6,16 @@ Python, SSH client, Docker daemon, disk space, and directory permissions.
 
 from __future__ import annotations
 
+import concurrent.futures
 import os
 import shutil
+import socket
 import sys
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 from typing import List
+from urllib.parse import urlparse
 
 from rich.console import Console
 from rich.table import Table
@@ -81,8 +84,8 @@ def check_ubuntu_version() -> DoctorItem:
                     category="OS",
                     name="Ubuntu Version",
                     status=CheckStatus.WARNING,
-                    details=f"{pretty_name} (Expected Ubuntu 22.04 or 24.04 LTS)",
-                    recommendation="DeployX is optimized for Ubuntu 22.04 and 24.04 LTS.",
+                    details=f"Ubuntu {version_id} detected (not yet in validated support matrix)",
+                    recommendation=f"DeployX has not yet been formally validated on Ubuntu {version_id}. Continuing in compatibility mode (validated: 22.04, 24.04 LTS).",
                 )
         else:
             return DoctorItem(
@@ -307,6 +310,138 @@ def check_deployx_directories() -> DoctorItem:
         )
 
 
+def _probe_dns(host: str, timeout: float = 2.0) -> bool:
+    """Probes DNS resolution with a strict timeout via ThreadPoolExecutor."""
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(socket.getaddrinfo, host, 443, socket.AF_UNSPEC, socket.SOCK_STREAM)
+            future.result(timeout=timeout)
+            return True
+    except Exception:
+        return False
+
+
+def _probe_tcp_connect(host: str, port: int = 443, timeout: float = 2.5) -> bool:
+    """Probes TCP connection with a short timeout."""
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except Exception:
+        return False
+
+
+def check_github_reachability() -> DoctorItem:
+    """Verifies reachability to GitHub (port 443)."""
+    dns_ok = _probe_dns("github.com", timeout=2.0)
+    if not dns_ok:
+        return DoctorItem(
+            category="Network",
+            name="GitHub Reachability",
+            status=CheckStatus.WARNING,
+            details="github.com DNS resolution failed",
+            recommendation="Verify server DNS resolver and outbound connectivity for github.com.",
+        )
+
+    tcp_ok = _probe_tcp_connect("github.com", 443, timeout=2.5)
+    if tcp_ok:
+        return DoctorItem(
+            category="Network",
+            name="GitHub Reachability",
+            status=CheckStatus.OK,
+            details="github.com reachable (HTTPS:443)",
+        )
+    return DoctorItem(
+        category="Network",
+        name="GitHub Reachability",
+        status=CheckStatus.WARNING,
+        details="github.com connection failed or timed out",
+        recommendation="Verify outbound HTTPS (port 443) connectivity or firewall rules.",
+    )
+
+
+def check_pypi_reachability() -> DoctorItem:
+    """Verifies reachability to Python package index (PyPI or custom mirror)."""
+    custom_index = os.getenv("PIP_INDEX_URL")
+    if custom_index:
+        parsed = urlparse(custom_index)
+        host = parsed.hostname or "custom-mirror"
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        is_custom = True
+    else:
+        host = "pypi.org"
+        port = 443
+        is_custom = False
+
+    dns_ok = _probe_dns(host, timeout=2.0)
+    tcp_ok = _probe_tcp_connect(host, port, timeout=2.5) if dns_ok else False
+
+    if tcp_ok:
+        label = f"Custom mirror ({host})" if is_custom else "pypi.org"
+        return DoctorItem(
+            category="Network",
+            name="Python Package Index",
+            status=CheckStatus.OK,
+            details=f"{label} reachable",
+        )
+
+    details = f"Cannot reach package index host '{host}'"
+    rec = "Check network or configure a reachable mirror: export PIP_INDEX_URL=https://<mirror>/simple/"
+    return DoctorItem(
+        category="Network",
+        name="Python Package Index",
+        status=CheckStatus.WARNING,
+        details=details,
+        recommendation=rec,
+    )
+
+
+def check_dns_resolution() -> DoctorItem:
+    """
+    Performs lightweight DNS resolution checks against key deployment hosts:
+    github.com, pypi.org, files.pythonhosted.org.
+    Detects inconsistent or partial DNS reachability.
+    """
+    hosts = ["github.com", "pypi.org", "files.pythonhosted.org"]
+    custom_index = os.getenv("PIP_INDEX_URL")
+    if custom_index:
+        parsed = urlparse(custom_index)
+        if parsed.hostname and parsed.hostname not in hosts:
+            hosts.append(parsed.hostname)
+
+    resolved: list[str] = []
+    failed: list[str] = []
+
+    for host in hosts:
+        if _probe_dns(host, timeout=2.0):
+            resolved.append(host)
+        else:
+            failed.append(host)
+
+    if not failed:
+        return DoctorItem(
+            category="Network",
+            name="DNS Resolution",
+            status=CheckStatus.OK,
+            details=f"All {len(hosts)} checked hosts resolved successfully",
+        )
+    elif resolved and failed:
+        return DoctorItem(
+            category="Network",
+            name="DNS Resolution",
+            status=CheckStatus.WARNING,
+            details="Partial DNS/network reachability detected. Some package/CDN hosts are not reachable.",
+            recommendation=f"Failed hosts: {', '.join(failed)}. Verify /etc/resolv.conf or test with custom PIP_INDEX_URL mirror.",
+        )
+    else:
+        return DoctorItem(
+            category="Network",
+            name="DNS Resolution",
+            status=CheckStatus.WARNING,
+            details="DNS resolution failed for all test hosts.",
+            recommendation="Server cannot resolve public domains. Check network configuration and DNS nameservers.",
+        )
+
+
 def collect_doctor_checks() -> List[DoctorItem]:
     """Runs all doctor checks and returns the list of results."""
     return [
@@ -319,6 +454,9 @@ def collect_doctor_checks() -> List[DoctorItem]:
         check_docker_daemon(),
         check_disk_space(),
         check_deployx_directories(),
+        check_github_reachability(),
+        check_pypi_reachability(),
+        check_dns_resolution(),
     ]
 
 

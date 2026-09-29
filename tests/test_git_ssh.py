@@ -57,13 +57,13 @@ def test_create_and_show_deploy_key(mocker):
 
 
 def test_verify_deploy_key_success(mocker):
-    from deployx.deployment.project import add_project
+    from deployx.deployment.project import add_project, load_project_config
     from rich.console import Console
 
     # Add project first
     add_project(
         name="private-app",
-        git="git@github.com:example/private.git",
+        git="git@github.com:acme-org/private.git",
         branch="main",
         private=True,
         domain=None,
@@ -72,17 +72,21 @@ def test_verify_deploy_key_success(mocker):
         console=Console(record=True),
     )
 
+    # Initially verified should be False
+    cfg_init = load_project_config("private-app")
+    assert cfg_init.git.verified is False
+
     # Create dummy key
     key_path = paths.get_project_key_path("private-app")
     key_path.write_text("private-key-data")
 
-    # Mock git ls-remote success
+    # Mock git ls-remote success with branch
     mocker.patch(
         "deployx.git.ssh.run_command",
         return_value=CommandResult(
             command=["git", "ls-remote"],
             returncode=0,
-            stdout="4ba128c704f056d61f1cf01bfbc7c1abf8da4e0f\tHEAD\n",
+            stdout="4ba128c704f056d61f1cf01bfbc7c1abf8da4e0f\trefs/heads/main\n",
             stderr="",
             duration=0.5,
         ),
@@ -91,11 +95,15 @@ def test_verify_deploy_key_success(mocker):
     ok = verify_deploy_key("private-app")
     assert ok is True
 
+    # After successful verify, config should have verified=True
+    cfg_after = load_project_config("private-app")
+    assert cfg_after.git.verified is True
+
 
 def test_git_repository_manager_env():
     pub_mgr = GitRepositoryManager(
         project_name="pub-app",
-        repo_url="https://github.com/example/pub.git",
+        repo_url="https://github.com/acme-org/pub.git",
         branch="main",
         private=False,
     )
@@ -103,7 +111,7 @@ def test_git_repository_manager_env():
 
     priv_mgr = GitRepositoryManager(
         project_name="priv-app",
-        repo_url="git@github.com:example/priv.git",
+        repo_url="git@github.com:acme-org/priv.git",
         branch="main",
         private=True,
     )
@@ -113,7 +121,7 @@ def test_git_repository_manager_env():
 def test_git_get_remote_commit(mocker):
     mgr = GitRepositoryManager(
         project_name="test-repo",
-        repo_url="https://github.com/example/test.git",
+        repo_url="https://github.com/acme-org/test.git",
         branch="main",
         private=False,
     )

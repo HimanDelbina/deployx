@@ -31,6 +31,19 @@ def run_update(project_name: str, console: Optional[Console] = None) -> bool:
     state_mgr = get_state_manager()
     state = state_mgr.get_state(valid_name)
 
+    if config.git.private and not getattr(config.git, "verified", False):
+        msg = (
+            "Private repository access has not been verified.\n\n"
+            "Run:\n"
+            f"deployx key create {valid_name}\n"
+            f"deployx key show {valid_name}\n"
+            f"deployx key verify {valid_name}"
+        )
+        if console:
+            console.print(f"[bold red]{msg}[/bold red]")
+        logger.error(msg)
+        return False
+
     if console:
         console.print(f"\n[cyan]Checking for updates for project '[bold]{valid_name}[/bold]'...[/cyan]")
     logger.info(f"Checking remote repository for updates: {config.git.repository} ({config.git.branch})")

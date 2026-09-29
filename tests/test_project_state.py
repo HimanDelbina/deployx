@@ -16,7 +16,7 @@ runner = CliRunner()
 
 
 @pytest.fixture(autouse=True)
-def setup_isolated_env(tmp_path, monkeypatch):
+def setup_isolated_env(tmp_path, monkeypatch, mocker):
     """Configures isolated test root for each test run."""
     root_dir = tmp_path / "deployx_root"
     config_dir = tmp_path / "deployx_etc"
@@ -24,6 +24,7 @@ def setup_isolated_env(tmp_path, monkeypatch):
     monkeypatch.setenv("DEPLOYX_CONFIG_DIR", str(config_dir))
     reload_paths()
     paths.ensure_all_dirs()
+    mocker.patch("deployx.deployment.project.verify_public_repository", return_value="f0222384a29ebcd90d80111bfbc7c1abf8da4e0f")
     yield
 
 
@@ -52,7 +53,7 @@ def test_cli_project_add_and_info():
         [
             "project", "add",
             "--name", "blog-app",
-            "--git", "https://github.com/example/blog.git",
+            "--git", "https://github.com/acme-org/blog.git",
             "--branch", "main",
             "--framework", "django",
             "--database", "postgres",
@@ -64,14 +65,14 @@ def test_cli_project_add_and_info():
 
     cfg = load_project_config("blog-app")
     assert cfg.project.name == "blog-app"
-    assert cfg.git.repository == "https://github.com/example/blog.git"
+    assert cfg.git.repository == "https://github.com/acme-org/blog.git"
     assert cfg.git.private is False
 
     # Check project info
     info_res = runner.invoke(app, ["project", "info", "blog-app"])
     assert info_res.exit_code == 0
     assert "blog-app" in info_res.stdout
-    assert "https://github.com/example/blog.git" in info_res.stdout
+    assert "https://github.com/acme-org/blog.git" in info_res.stdout
 
 
 def test_cli_project_add_duplicate():
@@ -81,7 +82,7 @@ def test_cli_project_add_duplicate():
         [
             "project", "add",
             "--name", "demo",
-            "--git", "https://github.com/example/demo.git",
+            "--git", "https://github.com/acme-org/demo.git",
         ],
     )
     # Add second time should fail
@@ -90,7 +91,7 @@ def test_cli_project_add_duplicate():
         [
             "project", "add",
             "--name", "demo",
-            "--git", "https://github.com/example/demo.git",
+            "--git", "https://github.com/acme-org/demo.git",
         ],
     )
     assert res2.exit_code == 1
@@ -103,7 +104,7 @@ def test_cli_project_list():
         [
             "project", "add",
             "--name", "proj-a",
-            "--git", "https://github.com/example/a.git",
+            "--git", "https://github.com/acme-org/a.git",
         ],
     )
     runner.invoke(
@@ -111,7 +112,7 @@ def test_cli_project_list():
         [
             "project", "add",
             "--name", "proj-b",
-            "--git", "git@github.com:example/b.git",
+            "--git", "git@github.com:acme-org/b.git",
             "--private",
         ],
     )
