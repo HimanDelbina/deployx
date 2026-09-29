@@ -5,6 +5,23 @@ All notable changes to DeployX are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.4] - 2026-09-29
+
+### Added
+- **Production-Grade Streaming Command Runner (`run_command_streaming`)**: Real-time line-by-line streaming of stdout and stderr via non-blocking worker threads, preserving exit codes, enforcing timeouts, and redacting sensitive strings on the fly.
+- **Docker BuildKit Live Output & Progress Parsing**: Integrates `BUILDKIT_PROGRESS=plain` and `--progress=plain` into `docker compose build`. Streamed output is parsed in real time to extract step counters (`5/10 steps`), approximate build percentages (`~50%`), and current operations without freezing the terminal.
+- **Overall Deployment Progress Tracking**: Clear stage progression across all 12 deployment stages (`Overall: 58% [███████████░░░░░░░░]`), clearly separating overall stage progress from Docker build step progress.
+- **Subprocess Activity Heartbeat**: Automatically emits lightweight progress heartbeats every 25 seconds for silent operations, keeping operators informed of elapsed time and activity without flooding the terminal.
+- **Build Stall Warnings & Contextual Network Hints**: Detects long-running silent operations exceeding threshold (120s) with actionable diagnostic hints, specifically highlighting potential registry, PyPI, apt, or network constraints if stalled during network-bound operations.
+- **Verbose & Plain Modes**:
+  - `deployx deploy <project> --verbose` / `deployx update <project> --verbose`: Displays full underlying command output in real time for detailed debugging.
+  - `deployx deploy <project> --plain` (and `--no-progress`): Clean text-only output without Rich Live redraws, ideal for CI/CD pipelines, log aggregators, and script automation.
+- **Synchronous Build & Deployment Logging**: All streamed build output is recorded to `/opt/deployx/logs/<project>/deploy.log` with secret redaction applied.
+- **Structured Failure Diagnostics**: On build failure, displays the exact failing stage, last build operation, exit code, and recent output snippet alongside troubleshooting instructions.
+- **Graceful Ctrl+C Handling**: Captures `KeyboardInterrupt` cleanly, terminates child subprocess trees to prevent orphaned processes, marks deployment state as cancelled, and exits without raw tracebacks.
+
+---
+
 ## [0.1.3] - 2026-09-29
 
 ### Fixed

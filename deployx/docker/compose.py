@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import List, Optional
+from typing import Any, Callable, List, Optional
 
 from rich.console import Console
 
@@ -28,14 +28,46 @@ class DockerComposeManager:
     def _base_cmd(self) -> List[str]:
         return ["docker", "compose", "-f", str(self.compose_file)]
 
-    def build(self, service: Optional[str] = None, no_cache: bool = False) -> CommandResult:
-        """Runs 'docker compose build'."""
-        cmd = self._base_cmd() + ["build"]
+    def build(
+        self,
+        service: Optional[str] = None,
+        no_cache: bool = False,
+        stream: bool = True,
+        on_line: Optional[Any] = None,
+        on_heartbeat: Optional[Any] = None,
+        on_stall: Optional[Any] = None,
+        log_file: Optional[Path | str] = None,
+        timeout: int = 1200,
+    ) -> CommandResult:
+        """
+        Runs 'docker compose build' with BuildKit plain progress output.
+        When stream=True, streams output incrementally to prevent silent freezes.
+        """
+        from deployx.core.command import run_command_streaming
+
+        cmd = self._base_cmd() + ["build", "--progress=plain"]
         if no_cache:
             cmd.append("--no-cache")
         if service:
             cmd.append(service)
-        return run_command(cmd, cwd=self.project_dir, timeout=600)
+
+        build_env = {
+            "DOCKER_BUILDKIT": "1",
+            "BUILDKIT_PROGRESS": "plain",
+        }
+
+        if stream:
+            return run_command_streaming(
+                cmd,
+                cwd=self.project_dir,
+                env=build_env,
+                timeout=timeout,
+                on_line=on_line,
+                on_heartbeat=on_heartbeat,
+                on_stall=on_stall,
+                log_file=log_file,
+            )
+        return run_command(cmd, cwd=self.project_dir, env=build_env, timeout=timeout)
 
     def up(self, services: Optional[List[str]] = None, detach: bool = True) -> CommandResult:
         """Runs 'docker compose up -d'."""

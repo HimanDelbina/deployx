@@ -17,6 +17,7 @@ from rich.panel import Panel
 
 from deployx.config import paths
 from deployx.core.command import CommandError, run_command
+from deployx.core.filesystem import ensure_directory
 from deployx.core.security import validate_project_name
 from deployx.deployment.health import perform_http_healthcheck
 from deployx.deployment.project import load_project_config
@@ -34,11 +35,14 @@ from deployx.models import (
     ProjectConfig,
 )
 from deployx.state import get_state_manager
+from deployx.ui.progress import DeploymentProgressReporter
 
 
 def run_deployment(
     project_name: str,
     target_commit: Optional[str] = None,
+    verbose: bool = False,
+    plain: bool = False,
     console: Optional[Console] = None,
 ) -> bool:
     """
@@ -49,6 +53,18 @@ def run_deployment(
     state_mgr = get_state_manager()
     current_state = state_mgr.get_state(valid_name)
 
+    log_dir = paths.get_project_log_dir(valid_name)
+    ensure_directory(log_dir, mode=0o750)
+    deploy_log_file = log_dir / "deploy.log"
+
+    reporter = DeploymentProgressReporter(
+        project_name=valid_name,
+        total_stages=12,
+        verbose=verbose,
+        plain=plain,
+        console=console,
+    )
+
     if console:
         console.print(f"\n[bold cyan]Starting Deployment Pipeline for '{valid_name}'[/bold cyan]")
 
@@ -56,8 +72,7 @@ def run_deployment(
 
     try:
         # Stage 1: Preflight checks & load configuration
-        if console:
-            console.print("[1/12] [cyan]Running preflight checks...[/cyan]")
+        reporter.start_stage(1, "Preflight checks & load configuration")
         try:
             config: ProjectConfig = load_project_config(valid_name)
         except Exception as exc:
@@ -106,8 +121,7 @@ def run_deployment(
                 )
 
         # Stage 2: Synchronize repository
-        if console:
-            console.print(f"[2/12] [cyan]Syncing repository ({config.git.branch})...[/cyan]")
+        reporter.start_stage(2, f"Syncing repository ({config.git.branch})")
         logger.info(f"Fetching repository: {config.git.repository} (branch: {config.git.branch})")
 
         repo_mgr = GitRepositoryManager(
@@ -126,28 +140,22 @@ def run_deployment(
 
         # Stage 3: Resolve commit & image version tagging
         image_tag = f"deployx_{valid_name}:{short_commit}"
-        if console:
-            console.print(
-                f"[3/12] [cyan]Resolved commit: [bold green]{short_commit}[/bold green] (Image: {image_tag})[/cyan]"
-            )
+        reporter.start_stage(3, f"Resolved commit: {short_commit} (Image: {image_tag})")
         logger.info(f"Target commit: {resolved_commit} -> Image tag: {image_tag}")
 
         # Stage 4: Analyze project codebase & infrastructure
-        if console:
-            console.print("[4/12] [cyan]Analyzing project and framework components...[/cyan]")
+        reporter.start_stage(4, "Analyzing project and framework components")
         detection = detect_repository(repo_mgr.repo_dir)
         logger.info(
             f"Framework detected: {detection.framework.value} (confidence: {detection.confidence:.2f})"
         )
 
         # Stage 5: Validate configuration & protect existing repo files
-        if console:
-            console.print("[5/12] [cyan]Validating deployment configuration...[/cyan]")
+        reporter.start_stage(5, "Validating deployment configuration")
         project_dir = paths.get_project_dir(valid_name)
 
         # Stage 6: Generate missing deployment configurations
-        if console:
-            console.print("[6/12] [cyan]Generating isolated deployment configurations...[/cyan]")
+        reporter.start_stage(6, "Generating isolated deployment configurations")
 
         # 6a. Production environment (.env.production)
         env_file = generate_production_env(
@@ -173,10 +181,16 @@ def run_deployment(
         compose_mgr = DockerComposeManager(valid_name, compose_file=compose_file)
 
         # Stage 7: Docker build
-        if console:
-            console.print(f"[7/12] [cyan]Building Docker image ([bold]{image_tag}[/bold])...[/cyan]")
+        reporter.start_stage(7, f"Building Docker image ({image_tag})")
         logger.info(f"Executing: docker compose build web")
-        compose_mgr.build(service="web")
+        compose_mgr.build(
+            service="web",
+            stream=True,
+            on_line=reporter.on_build_output,
+            on_heartbeat=reporter.on_heartbeat,
+            on_stall=reporter.on_stall,
+            log_file=deploy_log_file,
+        )
 
         # Stage 8: Spin up supporting infrastructure (PostgreSQL / Redis)
         infra_services = []
@@ -185,15 +199,14 @@ def run_deployment(
         if config.deployment.redis or detection.infrastructure.has_redis:
             infra_services.append("redis")
 
+        infra_label = f"Starting infrastructure services ({', '.join(infra_services)})" if infra_services else "Checking infrastructure services"
+        reporter.start_stage(8, infra_label)
         if infra_services:
-            if console:
-                console.print(f"[8/12] [cyan]Starting infrastructure services ({', '.join(infra_services)})...[/cyan]")
             logger.info(f"Starting infrastructure services: {infra_services}")
             compose_mgr.up(services=infra_services)
 
         # Stage 9: Execute database migrations inside container
-        if console:
-            console.print("[9/12] [cyan]Running database migrations in container...[/cyan]")
+        reporter.start_stage(9, "Running database migrations in container")
         logger.info("Executing migrations: python manage.py migrate --noinput")
         try:
             compose_mgr.run_transient("web", ["python", "manage.py", "migrate", "--noinput"])
@@ -201,8 +214,7 @@ def run_deployment(
             logger.warn(f"Migration command warning or non-critical skip: {mig_exc.message}")
 
         # Stage 10: Collect static files inside container
-        if console:
-            console.print("[10/12] [cyan]Collecting static files in container...[/cyan]")
+        reporter.start_stage(10, "Collecting static files in container")
         logger.info("Executing collectstatic: python manage.py collectstatic --noinput")
         try:
             compose_mgr.run_transient("web", ["python", "manage.py", "collectstatic", "--noinput"])
@@ -210,14 +222,12 @@ def run_deployment(
             logger.warn(f"Collectstatic warning or skip: {cs_exc.message}")
 
         # Stage 11: Start main web application
-        if console:
-            console.print("[11/12] [cyan]Starting application containers...[/cyan]")
+        reporter.start_stage(11, "Starting application containers")
         logger.info("Starting web container: docker compose up -d web")
         compose_mgr.up(services=["web"])
 
         # Stage 12: Health check & state persistence
-        if console:
-            console.print("[12/12] [cyan]Performing application health check...[/cyan]")
+        reporter.start_stage(12, "Performing application health check")
 
         health_ok = True
         if config.deployment.healthcheck.enabled:
@@ -278,6 +288,32 @@ def run_deployment(
             )
         return True
 
+    except KeyboardInterrupt:
+        logger.warn(f"Deployment cancelled by user (Ctrl+C) for '{valid_name}'")
+        now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        fail_state = current_state or DeploymentState.new(valid_name, "", "main")
+        fail_state.status = DeploymentStatus.FAILED
+        fail_state.last_error = "Deployment cancelled by user"
+        state_mgr.save_state(fail_state)
+
+        if console:
+            console.print("\n[bold yellow]Deployment cancelled by user.[/bold yellow]")
+        return False
+
+    except CommandError as exc:
+        logger.error(f"Deployment command failed: {exc}")
+        now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        fail_state = current_state or DeploymentState.new(valid_name, "", "main")
+        fail_state.status = DeploymentStatus.FAILED
+        fail_state.last_error = str(exc)
+        state_mgr.save_state(fail_state)
+
+        reporter.show_failure_summary(
+            exit_code=exc.returncode,
+            exception_msg=exc.message + (f"\n{exc.actionable_advice}" if exc.actionable_advice else ""),
+        )
+        return False
+
     except Exception as exc:
         logger.error(f"Deployment failed: {exc}")
         now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
@@ -286,15 +322,8 @@ def run_deployment(
         fail_state.last_error = str(exc)
         state_mgr.save_state(fail_state)
 
-        if console:
-            console.print(
-                Panel(
-                    f"[bold red]Deployment failed for '{valid_name}':[/bold red]\n\n"
-                    f"{exc}\n\n"
-                    f"Check full logs with: [bold cyan]cat /opt/deployx/logs/{valid_name}/deploy.log[/bold cyan]\n"
-                    f"Or view container logs: [bold cyan]deployx logs {valid_name}[/bold cyan]",
-                    title="Deployment Error",
-                    border_style="red",
-                )
-            )
+        reporter.show_failure_summary(
+            exit_code=1,
+            exception_msg=str(exc),
+        )
         return False

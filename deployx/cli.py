@@ -352,24 +352,44 @@ def key_remove(
 # ----------------------------------------------------------------------
 @app.command("deploy")
 @handle_cli_exceptions
-def deploy(project: str = typer.Argument(..., help="Project name")):
+def deploy(
+    project: str = typer.Argument(..., help="Project name"),
+    verbose: bool = typer.Option(False, "--verbose", "-V", help="Show detailed command and build output"),
+    plain: bool = typer.Option(False, "--plain", help="Plain text output without live redraws (recommended for CI)"),
+    no_progress: bool = typer.Option(False, "--no-progress", help="Disable live progress bar"),
+):
     """
     Execute full deployment pipeline for a registered project.
     """
     from deployx.deployment.deploy import run_deployment
-    success = run_deployment(project, console=console)
+    success = run_deployment(
+        project,
+        verbose=verbose,
+        plain=(plain or no_progress),
+        console=console,
+    )
     if not success:
         raise typer.Exit(1)
 
 
 @app.command("update")
 @handle_cli_exceptions
-def update(project: str = typer.Argument(..., help="Project name")):
+def update(
+    project: str = typer.Argument(..., help="Project name"),
+    verbose: bool = typer.Option(False, "--verbose", "-V", help="Show detailed command and build output"),
+    plain: bool = typer.Option(False, "--plain", help="Plain text output without live redraws (recommended for CI)"),
+    no_progress: bool = typer.Option(False, "--no-progress", help="Disable live progress bar"),
+):
     """
     Check remote Git repository for new commits and perform an incremental update.
     """
     from deployx.deployment.update import run_update
-    success = run_update(project, console=console)
+    success = run_update(
+        project,
+        verbose=verbose,
+        plain=(plain or no_progress),
+        console=console,
+    )
     if not success:
         raise typer.Exit(1)
 

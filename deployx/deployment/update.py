@@ -19,7 +19,12 @@ from deployx.logging.logger import ProjectLogger
 from deployx.state import get_state_manager
 
 
-def run_update(project_name: str, console: Optional[Console] = None) -> bool:
+def run_update(
+    project_name: str,
+    verbose: bool = False,
+    plain: bool = False,
+    console: Optional[Console] = None,
+) -> bool:
     """
     Checks if a newer commit is available on the remote Git repository.
     If up to date, skips unnecessary rebuilds.
@@ -123,4 +128,9 @@ def run_update(project_name: str, console: Optional[Console] = None) -> bool:
         )
 
     # Trigger deployment for the new commit
-    return run_deployment(valid_name, target_commit=remote_sha, console=console)
+    deploy_kwargs = {"console": console}
+    if verbose:
+        deploy_kwargs["verbose"] = True
+    if plain:
+        deploy_kwargs["plain"] = True
+    return run_deployment(valid_name, target_commit=remote_sha, **deploy_kwargs)

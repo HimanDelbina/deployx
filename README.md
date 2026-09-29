@@ -1,4 +1,4 @@
-# DeployX (v0.1.3)
+# DeployX (v0.1.4)
 
 > **Production-Grade Autonomous Deployment Manager for Ubuntu Linux servers (22.04 / 24.04 LTS).**  
 > Effortlessly register, verify, deploy, and incrementally update public and private GitHub projects using Docker and Docker Compose v2 with zero host bloat.
