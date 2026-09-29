@@ -25,12 +25,14 @@ from deployx.core.filesystem import atomic_write_file, ensure_directory, set_sec
 from deployx.core.security import (
     SecurityError,
     format_validation_error,
+    redact_url_credentials,
     validate_domain,
     validate_git_url,
     validate_project_name,
 )
 from deployx.logging.logger import ProjectLogger
 from deployx.models import (
+    BuildConfig,
     DatabasePreference,
     DeploymentConfig,
     DeploymentState,
@@ -41,6 +43,7 @@ from deployx.models import (
     HealthcheckConfig,
     ProjectConfig,
     ProjectMeta,
+    PythonBuildConfig,
 )
 from deployx.state import get_state_manager
 
@@ -516,6 +519,20 @@ def show_project_info(project: str, console: Console) -> None:
         f"[bold]Compose File:[/bold]        {cfg.deployment.docker.compose_file}",
         f"[bold]Created At:[/bold]          {created_at_val}",
         f"[bold]Updated At:[/bold]          {updated_at_val}",
+    ]
+
+    py_build = getattr(getattr(cfg, "build", None), "python", None)
+    if py_build and py_build.index_url:
+        info_text.append(f"[bold]Python Package Index:[/bold] Custom")
+        info_text.append(f"[bold]Index URL:[/bold]            {redact_url_credentials(py_build.index_url)}")
+        if py_build.extra_index_url:
+            info_text.append(f"[bold]Extra Index URL:[/bold]      {redact_url_credentials(py_build.extra_index_url)}")
+        if py_build.trusted_host:
+            info_text.append(f"[bold]Trusted Host:[/bold]         {py_build.trusted_host}")
+    else:
+        info_text.append(f"[bold]Python Package Index:[/bold] Default (PyPI)")
+
+    info_text.extend([
         "",
         "[bold cyan]--- Deployment State ---[/bold cyan]",
         f"[bold]Deployment Status:[/bold]   {state.status.value if state else 'pending'}",
@@ -524,7 +541,7 @@ def show_project_info(project: str, console: Console) -> None:
         f"[bold]Previous Commit:[/bold]     {state.previous_commit or 'None' if state else 'None'}",
         f"[bold]Last Deployed At:[/bold]    {state.deployed_at or 'Never' if state else 'Never'}",
         f"[bold]Docker Image:[/bold]        {state.docker_image or 'None' if state else 'None'}",
-    ]
+    ])
 
     if state and state.last_error:
         info_text.append(f"[bold red]Last Error:[/bold red]         {state.last_error}")
@@ -721,6 +738,10 @@ def edit_project(
     port: Optional[int] = None,
     redis: Optional[bool] = None,
     worker: Optional[bool] = None,
+    pip_index_url: Optional[str] = None,
+    pip_extra_index_url: Optional[str] = None,
+    pip_trusted_host: Optional[str] = None,
+    clear_pip_index: bool = False,
     non_interactive: bool = False,
     yes: bool = False,
     console: Optional[Console] = None,
@@ -783,11 +804,17 @@ def edit_project(
         current_redis = cfg.deployment.redis
         current_worker = cfg.deployment.celery
         current_created_at = getattr(cfg.project, "created_at", None)
+        py_build = getattr(getattr(cfg, "build", None), "python", None)
+        current_pip_index = py_build.index_url if py_build else None
+        current_pip_extra_index = py_build.extra_index_url if py_build else None
+        current_pip_trusted_host = py_build.trusted_host if py_build else None
     else:
         raw_git = raw_data.get("git", {}) if isinstance(raw_data.get("git"), dict) else {}
         raw_dep = raw_data.get("deployment", {}) if isinstance(raw_data.get("deployment"), dict) else {}
         raw_proj = raw_data.get("project", {}) if isinstance(raw_data.get("project"), dict) else {}
         raw_docker = raw_dep.get("docker", {}) if isinstance(raw_dep.get("docker"), dict) else {}
+        raw_build = raw_data.get("build", {}) if isinstance(raw_data.get("build"), dict) else {}
+        raw_python = raw_build.get("python", {}) if isinstance(raw_build.get("python"), dict) else {}
 
         current_repo = str(raw_git.get("repository", ""))
         current_branch = str(raw_git.get("branch", "main"))
@@ -799,6 +826,9 @@ def edit_project(
         current_redis = bool(raw_dep.get("redis", False))
         current_worker = bool(raw_dep.get("celery", False))
         current_created_at = raw_proj.get("created_at", None)
+        current_pip_index = raw_python.get("index_url", None)
+        current_pip_extra_index = raw_python.get("extra_index_url", None)
+        current_pip_trusted_host = raw_python.get("trusted_host", None)
 
     flags_provided = (
         git is not None
@@ -812,6 +842,10 @@ def edit_project(
         or port is not None
         or redis is not None
         or worker is not None
+        or pip_index_url is not None
+        or pip_extra_index_url is not None
+        or pip_trusted_host is not None
+        or clear_pip_index
     )
 
     # Interactive prompt fallback if no flags provided
@@ -903,6 +937,26 @@ def edit_project(
     target_redis = redis if redis is not None else current_redis
     target_worker = worker if worker is not None else current_worker
 
+    # Resolve target pip mirror parameters
+    target_pip_index = current_pip_index
+    target_pip_extra_index = current_pip_extra_index
+    target_pip_trusted_host = current_pip_trusted_host
+
+    if clear_pip_index:
+        target_pip_index = None
+        target_pip_extra_index = None
+        target_pip_trusted_host = None
+    else:
+        if pip_index_url is not None:
+            clean_idx = pip_index_url.strip()
+            target_pip_index = clean_idx if clean_idx else None
+        if pip_extra_index_url is not None:
+            clean_extra = pip_extra_index_url.strip()
+            target_pip_extra_index = clean_extra if clean_extra else None
+        if pip_trusted_host is not None:
+            clean_host = pip_trusted_host.strip()
+            target_pip_trusted_host = clean_host if clean_host else None
+
     # Build and validate proposed new ProjectConfig
     now_iso = datetime.now(timezone.utc).isoformat()
     try:
@@ -928,6 +982,13 @@ def edit_project(
                 redis=target_redis,
                 celery=target_worker,
             ),
+            build=BuildConfig(
+                python=PythonBuildConfig(
+                    index_url=target_pip_index,
+                    extra_index_url=target_pip_extra_index,
+                    trusted_host=target_pip_trusted_host,
+                )
+            ),
         )
     except Exception as exc:
         console.print(
@@ -936,6 +997,9 @@ def edit_project(
         raise SystemExit(1)
 
     # Display Current vs New Summary Panel
+    curr_pip_display = redact_url_credentials(current_pip_index) if current_pip_index else "Default (PyPI)"
+    target_pip_display = redact_url_credentials(target_pip_index) if target_pip_index else "Default (PyPI)"
+
     summary_text = (
         f"[bold]Current configuration:[/bold]\n"
         f"  Repository: {current_repo}\n"
@@ -943,14 +1007,16 @@ def edit_project(
         f"  Private:    {'Yes' if current_private else 'No'}\n"
         f"  Domain:     {current_domain or 'None'}\n"
         f"  Framework:  {current_framework_str}\n"
-        f"  Database:   {current_database_str}\n\n"
+        f"  Database:   {current_database_str}\n"
+        f"  PIP Index:  {curr_pip_display}\n\n"
         f"[bold]New configuration:[/bold]\n"
         f"  Repository: {target_git}\n"
         f"  Branch:     {target_branch}\n"
         f"  Private:    {'Yes' if target_private else 'No'}\n"
         f"  Domain:     {target_domain or 'None'}\n"
         f"  Framework:  {target_framework_str}\n"
-        f"  Database:   {target_database_str}"
+        f"  Database:   {target_database_str}\n"
+        f"  PIP Index:  {target_pip_display}"
     )
     console.print(Panel(summary_text, title=f"Project Configuration Edit: {valid_name}", border_style="cyan"))
 

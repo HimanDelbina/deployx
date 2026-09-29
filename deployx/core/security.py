@@ -274,9 +274,34 @@ def generate_db_password(length: int = 32) -> str:
     return "".join(secrets.choice(alphabet) for _ in range(length))
 
 
+URL_CREDENTIALS_REGEX = re.compile(
+    r"(https?://)(?:([^:/@\s]+):([^@\s]+)|([^/@\s]+))@"
+)
+
+
+def redact_url_credentials(url: str) -> str:
+    """
+    Redacts usernames/passwords/tokens from HTTP and HTTPS URLs.
+    Example:
+      https://user:password@example.com/simple/ -> https://user:***@example.com/simple/
+      https://token@example.com/simple/ -> https://***@example.com/simple/
+    """
+    if not url:
+        return url
+
+    def _replace_cred(match: re.Match) -> str:
+        protocol = match.group(1)
+        user = match.group(2)
+        if user:
+            return f"{protocol}{user}:***@"
+        return f"{protocol}***@"
+
+    return URL_CREDENTIALS_REGEX.sub(_replace_cred, url)
+
+
 def redact_sensitive_text(text: str, extra_secrets: list[str] | None = None) -> str:
     """
-    Redacts private keys, known secrets, and password assignments from text/logs.
+    Redacts private keys, known secrets, password assignments, and URL credentials from text/logs.
     """
     if not text:
         return text
@@ -290,8 +315,11 @@ def redact_sensitive_text(text: str, extra_secrets: list[str] | None = None) -> 
         return f"{key}=[REDACTED]"
     
     redacted = SECRET_ASSIGNMENT_REGEX.sub(_replace_secret_assignment, redacted)
+
+    # 3. Redact URL credentials (passwords, tokens in https://... URLs)
+    redacted = redact_url_credentials(redacted)
     
-    # 3. Redact any explicitly registered secrets
+    # 4. Redact any explicitly registered secrets
     if extra_secrets:
         for secret_val in extra_secrets:
             if secret_val and len(secret_val) >= 4:

@@ -1,4 +1,4 @@
-# DeployX (v0.1.4)
+# DeployX (v0.1.5)
 
 > **Production-Grade Autonomous Deployment Manager for Ubuntu Linux servers (22.04 / 24.04 LTS).**  
 > Effortlessly register, verify, deploy, and incrementally update public and private GitHub projects using Docker and Docker Compose v2 with zero host bloat.
@@ -236,6 +236,10 @@ Supported edit flags:
 - `--database <postgres|sqlite|mysql|none>`: Change database backend.
 - `--redis / --no-redis`: Toggle Redis container.
 - `--worker / --no-worker`: Toggle background Celery/RQ worker.
+- `--pip-index-url <url>`: Set custom Python PyPI package index URL for container builds.
+- `--pip-extra-index-url <url>`: Set secondary/extra package index URL.
+- `--pip-trusted-host <host>`: Mark package index hostname as trusted.
+- `--clear-pip-index`: Reset Python build mirror back to official PyPI defaults.
 
 ### Safe Project Removal
 DeployX provides three distinct tiers of project removal, prioritizing data safety:
@@ -328,8 +332,9 @@ deployx update my-django-app
 | `deployx key show <project>` | Displays public SSH deploy key |
 | `deployx key verify <project>` | Tests SSH authentication against remote repository & verifies branch |
 | `deployx key remove <project>` | Explicitly removes SSH deploy key pair with confirmation |
-| `deployx deploy <project>` | Builds, provisions, and deploys the project |
-| `deployx update <project>` | Performs zero-drift, SHA-checked incremental update |
+| `deployx deploy <project>` | Builds, provisions, and deploys the project (supports `--regenerate`) |
+| `deployx update <project>` | Performs zero-drift, SHA-checked incremental update (supports `--regenerate`) |
+| `deployx generate <project>` | Safely regenerates DeployX-owned files (`Dockerfile.deployx`, compose manifest) |
 | `deployx status <project>` | Inspects live container statuses and healthcheck state |
 | `deployx logs <project>` | Views streaming or tailed Docker container logs (`--tail 100`, `--follow`) |
 | `deployx restart <project>` | Restarts project containers safely |
@@ -352,6 +357,11 @@ git:
   branch: main
   private: true
   verified: true        # Automatically maintained by DeployX
+build:
+  python:
+    index_url: https://mirrors.aliyun.com/pypi/simple/   # Optional custom PyPI mirror
+    extra_index_url: null
+    trusted_host: mirrors.aliyun.com
 deployment:
   framework: django
   domain: portal.example.com

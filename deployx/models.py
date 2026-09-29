@@ -109,6 +109,41 @@ class DeploymentConfig(BaseModel):
         return validate_domain(v)
 
 
+class PythonBuildConfig(BaseModel):
+    index_url: str | None = None
+    extra_index_url: str | None = None
+    trusted_host: str | None = None
+
+    @field_validator("index_url", "extra_index_url")
+    @classmethod
+    def validate_url(cls, v: str | None) -> str | None:
+        if v is not None:
+            clean = v.strip()
+            if not clean:
+                return None
+            if not (clean.startswith("http://") or clean.startswith("https://")):
+                raise ValueError("Package index URL must start with 'http://' or 'https://'")
+            return clean
+        return v
+
+    @field_validator("trusted_host")
+    @classmethod
+    def validate_host(cls, v: str | None) -> str | None:
+        if v is not None:
+            clean = v.strip()
+            return clean if clean else None
+        return v
+
+
+class AptBuildConfig(BaseModel):
+    mirror_url: str | None = None
+
+
+class BuildConfig(BaseModel):
+    python: PythonBuildConfig = Field(default_factory=PythonBuildConfig)
+    apt: AptBuildConfig = Field(default_factory=AptBuildConfig)
+
+
 class ProjectConfig(BaseModel):
     """
     Schema for /opt/deployx/projects/<name>/deployx.yml
@@ -118,6 +153,7 @@ class ProjectConfig(BaseModel):
     project: ProjectMeta
     git: GitConfig
     deployment: DeploymentConfig = Field(default_factory=DeploymentConfig)
+    build: BuildConfig = Field(default_factory=BuildConfig)
 
     def to_yaml(self) -> str:
         data = self.model_dump(mode="json")

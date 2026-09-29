@@ -216,6 +216,10 @@ def project_edit(
     port: Optional[int] = typer.Option(None, "--port", help="New external port"),
     redis: Optional[bool] = typer.Option(None, "--redis/--no-redis", help="Toggle Redis container"),
     worker: Optional[bool] = typer.Option(None, "--worker/--no-worker", help="Toggle Celery/RQ background worker"),
+    pip_index_url: Optional[str] = typer.Option(None, "--pip-index-url", help="Custom PyPI/Python mirror index URL"),
+    pip_extra_index_url: Optional[str] = typer.Option(None, "--pip-extra-index-url", help="Extra Python package index URL"),
+    pip_trusted_host: Optional[str] = typer.Option(None, "--pip-trusted-host", help="Trusted host for Python package index"),
+    clear_pip_index: bool = typer.Option(False, "--clear-pip-index", help="Reset Python package index to default PyPI"),
     non_interactive: bool = typer.Option(False, "--non-interactive", help="Disable interactive prompts"),
     yes: bool = typer.Option(False, "--yes", "-y", help="Apply changes without confirmation"),
 ):
@@ -236,6 +240,10 @@ def project_edit(
         port=port,
         redis=redis,
         worker=worker,
+        pip_index_url=pip_index_url,
+        pip_extra_index_url=pip_extra_index_url,
+        pip_trusted_host=pip_trusted_host,
+        clear_pip_index=clear_pip_index,
         non_interactive=non_interactive,
         yes=yes,
         console=console,
@@ -357,6 +365,7 @@ def deploy(
     verbose: bool = typer.Option(False, "--verbose", "-V", help="Show detailed command and build output"),
     plain: bool = typer.Option(False, "--plain", help="Plain text output without live redraws (recommended for CI)"),
     no_progress: bool = typer.Option(False, "--no-progress", help="Disable live progress bar"),
+    regenerate: bool = typer.Option(False, "--regenerate", help="Force regeneration of DeployX-owned deployment files"),
 ):
     """
     Execute full deployment pipeline for a registered project.
@@ -366,6 +375,7 @@ def deploy(
         project,
         verbose=verbose,
         plain=(plain or no_progress),
+        regenerate=regenerate,
         console=console,
     )
     if not success:
@@ -379,6 +389,7 @@ def update(
     verbose: bool = typer.Option(False, "--verbose", "-V", help="Show detailed command and build output"),
     plain: bool = typer.Option(False, "--plain", help="Plain text output without live redraws (recommended for CI)"),
     no_progress: bool = typer.Option(False, "--no-progress", help="Disable live progress bar"),
+    regenerate: bool = typer.Option(False, "--regenerate", help="Force regeneration of DeployX-owned deployment files"),
 ):
     """
     Check remote Git repository for new commits and perform an incremental update.
@@ -388,10 +399,61 @@ def update(
         project,
         verbose=verbose,
         plain=(plain or no_progress),
+        regenerate=regenerate,
         console=console,
     )
     if not success:
         raise typer.Exit(1)
+
+
+@app.command("generate")
+@handle_cli_exceptions
+def generate(
+    project: str = typer.Argument(..., help="Project name"),
+):
+    """
+    Safely regenerate DeployX-owned deployment files (Dockerfile.deployx, docker-compose.deployx.yml).
+    Strictly preserves user-owned Dockerfiles and configs.
+    """
+    from deployx.config import paths
+    from deployx.core.security import validate_project_name
+    from deployx.deployment.project import load_project_config
+    from deployx.detectors.registry import detect_repository
+    from deployx.generators.django import (
+        generate_compose_file,
+        generate_django_dockerfile,
+        is_deployx_generated_file,
+    )
+    from deployx.state import get_state_manager
+
+    valid_name = validate_project_name(project)
+    config = load_project_config(valid_name)
+    project_dir = paths.get_project_dir(valid_name)
+    repo_dir = paths.get_project_repo_dir(valid_name)
+    detection = detect_repository(repo_dir)
+
+    state = get_state_manager().get_state(valid_name)
+    commit = (state.current_commit[:7]) if (state and state.current_commit) else "latest"
+    image_tag = f"deployx_{valid_name}:{commit}"
+
+    # 1. Dockerfile
+    if detection.infrastructure.has_dockerfile:
+        console.print(f"[dim]Preserving repository Dockerfile at {detection.infrastructure.dockerfile_path}[/dim]")
+    else:
+        df_path = project_dir / "Dockerfile.deployx"
+        if df_path.is_file() and not is_deployx_generated_file(df_path):
+            console.print(f"[yellow]Preserving user-owned Dockerfile at {df_path} (missing DeployX marker)[/yellow]")
+        else:
+            generate_django_dockerfile(config, detection, df_path)
+            console.print(f"[green]Regenerated Dockerfile at {df_path}[/green]")
+
+    # 2. Compose file
+    compose_file = project_dir / "docker-compose.deployx.yml"
+    if compose_file.is_file() and not is_deployx_generated_file(compose_file):
+        console.print(f"[yellow]Preserving user-owned Compose file at {compose_file} (missing DeployX marker)[/yellow]")
+    else:
+        generate_compose_file(config, detection, image_tag, compose_file)
+        console.print(f"[green]Regenerated Compose manifest at {compose_file}[/green]")
 
 
 @app.command("status")

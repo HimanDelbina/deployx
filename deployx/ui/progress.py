@@ -55,18 +55,13 @@ class BuildKitParser:
         self.last_relevant_lines: List[str] = []
         self.max_history: int = 20
 
-    def parse_line(self, line: str) -> None:
-        """Parses a streamed line and updates current build state."""
-        clean = line.strip()
+    def _process_text(self, text: str) -> None:
+        """Extracts build step counter and current operation from a line of text."""
+        clean = text.strip()
         if not clean:
             return
 
-        # Maintain recent output history for error diagnostics
-        self.last_relevant_lines.append(clean)
-        if len(self.last_relevant_lines) > self.max_history:
-            self.last_relevant_lines.pop(0)
-
-        # Check for step counter [x/y]
+        # Check for step counter [x/y] e.g. [5/8] RUN pip install...
         match_step = self.RE_BUILDKIT_STEP.search(clean)
         if match_step:
             try:
@@ -99,6 +94,101 @@ class BuildKitParser:
         match_cmd = self.RE_RUN_CMD.match(clean)
         if match_cmd:
             self.current_operation = clean[:80]
+
+    def parse_line(self, line: str) -> None:
+        """Parses a streamed line (plain text or BuildKit/Buildx rawjson) and updates build state."""
+        clean = line.strip()
+        if not clean:
+            return
+
+        # Handle BuildKit / Docker Buildx rawjson event objects
+        if clean.startswith("{") and clean.endswith("}"):
+            try:
+                import base64
+                import json
+                data = json.loads(clean)
+                if isinstance(data, dict):
+                    # 1. Check vertex
+                    v = data.get("vertex")
+                    if isinstance(v, dict):
+                        name = v.get("name")
+                        if name:
+                            self.last_relevant_lines.append(str(name))
+                            self._process_text(str(name))
+                    elif isinstance(v, str):
+                        self.last_relevant_lines.append(v)
+                        self._process_text(v)
+
+                    # 2. Check vertices list
+                    vertices = data.get("vertices")
+                    if isinstance(vertices, list):
+                        for item in vertices:
+                            if isinstance(item, dict) and item.get("name"):
+                                self.last_relevant_lines.append(str(item["name"]))
+                                self._process_text(str(item["name"]))
+
+                    # 3. Check statuses list
+                    statuses = data.get("statuses")
+                    if isinstance(statuses, list):
+                        for s in statuses:
+                            if isinstance(s, dict):
+                                if s.get("name"):
+                                    self._process_text(str(s["name"]))
+                                if s.get("id"):
+                                    self._process_text(str(s["id"]))
+                                if "current" in s and "total" in s:
+                                    try:
+                                        self.step_current = int(s["current"])
+                                        self.step_total = int(s["total"])
+                                        if self.step_total > 0:
+                                            self.approx_percent = int((self.step_current / self.step_total) * 100)
+                                    except Exception:
+                                        pass
+
+                    # 4. Check logs list
+                    logs = data.get("logs")
+                    if isinstance(logs, list):
+                        for log_entry in logs:
+                            if isinstance(log_entry, dict):
+                                raw_bytes = log_entry.get("data")
+                                if raw_bytes:
+                                    try:
+                                        decoded = base64.b64decode(raw_bytes).decode("utf-8", errors="replace")
+                                        for decoded_line in decoded.splitlines():
+                                            self.last_relevant_lines.append(decoded_line.strip())
+                                            self._process_text(decoded_line)
+                                    except Exception:
+                                        pass
+
+                    # 5. Direct keys
+                    for key in ("name", "status", "id", "action", "stream", "message"):
+                        val = data.get(key)
+                        if isinstance(val, str) and val:
+                            self.last_relevant_lines.append(val)
+                            self._process_text(val)
+
+                    if "current" in data and "total" in data:
+                        try:
+                            self.step_current = int(data["current"])
+                            self.step_total = int(data["total"])
+                            if self.step_total > 0:
+                                self.approx_percent = int((self.step_current / self.step_total) * 100)
+                        except Exception:
+                            pass
+
+                    # Bound history length
+                    if len(self.last_relevant_lines) > self.max_history:
+                        self.last_relevant_lines = self.last_relevant_lines[-self.max_history:]
+                    return
+            except Exception:
+                pass
+
+        # Maintain recent output history for error diagnostics
+        self.last_relevant_lines.append(clean)
+        if len(self.last_relevant_lines) > self.max_history:
+            self.last_relevant_lines.pop(0)
+
+        self._process_text(clean)
 
     def get_progress_label(self) -> str:
         """Returns structured progress label or 'active' if steps unknown."""
@@ -153,11 +243,15 @@ class DeploymentProgressReporter:
         verbose: bool = False,
         plain: bool = False,
         console: Optional[Console] = None,
+        config: Optional[Any] = None,
+        python_index: Optional[str] = None,
     ):
         self.project_name = project_name
         self.total_stages = total_stages
         self.verbose = verbose
         self.console = console or Console()
+        self.config = config
+        self.python_index = python_index
         
         # Plain mode if requested, or if stdout is not an interactive terminal
         is_tty = getattr(self.console, "is_terminal", False) or (sys.stdout and sys.stdout.isatty())
@@ -173,6 +267,7 @@ class DeploymentProgressReporter:
         self.live_context = None
         self._last_heartbeat_time: float = self.deployment_start_time
         self.stall_reported: bool = False
+        self._last_reported_step_op: Optional[tuple[Optional[int], Optional[str]]] = None
 
     @property
     def overall_percentage(self) -> int:
@@ -209,20 +304,40 @@ class DeploymentProgressReporter:
         self.last_activity_time = time.time()
         self.parser.parse_line(line)
 
+        # Track and display build step advances
+        curr_step = self.parser.step_current
+        tot_step = self.parser.step_total
+        op = self.parser.current_operation or ""
+
+        current_pair = (curr_step, op)
+        if current_pair != self._last_reported_step_op and (curr_step is not None or op):
+            self._last_reported_step_op = current_pair
+            if self.plain:
+                if curr_step is not None and tot_step is not None:
+                    pct = self.parser.approx_percent
+                    pct_str = f"~{pct}%" if pct is not None else "active"
+                    if op:
+                        self.console.print(f"  [Build {pct_str}] Step {curr_step}/{tot_step}: {op[:60]}")
+                    else:
+                        self.console.print(f"  [Build {pct_str}] Step {curr_step}/{tot_step}")
+                elif op:
+                    self.console.print(f"  [Build] {op[:60]}")
+            elif not self.verbose:
+                if curr_step is not None and tot_step is not None:
+                    step_prefix = f"Build step {curr_step}/{tot_step}"
+                elif curr_step is not None:
+                    step_prefix = f"Build step {curr_step}"
+                else:
+                    step_prefix = "Build step"
+
+                if op:
+                    self.console.print(f"  [cyan]{step_prefix}:[/cyan] [bold]{op}[/bold]")
+                else:
+                    self.console.print(f"  [cyan]{step_prefix}[/cyan]")
+
         if self.verbose:
             # In verbose mode, show underlying build lines directly
             self.console.print(f"[dim]{line}[/dim]")
-        elif self.plain:
-            # In plain mode, display step advances without flooding
-            if self.parser.step_current is not None and line.strip().startswith(("[", "#")):
-                # Check if it's a primary step definition line
-                if self.parser.RE_BUILDKIT_STEP.search(line):
-                    op = self.parser.current_operation or ""
-                    pct = self.parser.approx_percent
-                    pct_str = f"~{pct}%" if pct is not None else "active"
-                    self.console.print(
-                        f"  [Build {pct_str}] Step {self.parser.step_current}/{self.parser.step_total}: {op[:60]}"
-                    )
 
     def on_heartbeat(self, elapsed: float, idle: float) -> None:
         """Emitted when a subprocess is silent for 20-30 seconds."""
@@ -235,27 +350,36 @@ class DeploymentProgressReporter:
 
     def on_stall(self, elapsed: float, idle: float) -> None:
         """Emitted when no output has been seen for the stall threshold (e.g. 120s)."""
+        import os
+        from deployx.core.security import redact_url_credentials
+
         idle_min = int(idle // 60)
+        idle_sec = int(idle)
         self.stall_reported = True
 
+        # Resolve configured Python index
+        index_label = "Default (PyPI)"
+        if self.python_index:
+            index_label = f"Custom ({redact_url_credentials(self.python_index)})"
+        elif self.config:
+            py_build = getattr(getattr(self.config, "build", None), "python", None)
+            eff = os.environ.get("PIP_INDEX_URL") or (py_build.index_url if py_build else None)
+            if eff:
+                index_label = f"Custom ({redact_url_credentials(eff)})"
+        elif os.environ.get("PIP_INDEX_URL"):
+            index_label = f"Custom ({redact_url_credentials(os.environ['PIP_INDEX_URL'])})"
+
+        current_step = self.parser.current_operation or "Unknown / Initialization"
+
         stall_msg = (
-            f"[bold yellow]WARNING: No new Docker build output for {idle_min} minutes.[/bold yellow]\n\n"
-            f"The process is still running.\n\n"
-            f"[bold]Possible causes:[/bold]\n"
-            f"  - Slow Docker registry response or large base image pull\n"
-            f"  - Package download delay (PyPI / apt / npm mirrors)\n"
-            f"  - DNS or network connectivity latency\n"
-            f"  - Heavy compilation or C-extension building\n\n"
-        )
-
-        if self.parser.is_network_operation() and self.parser.current_operation:
-            stall_msg += (
-                f"[bold cyan]Contextual Notice:[/bold cyan]\n"
-                f"  No build output for {int(idle)}s while running: [dim]{self.parser.current_operation}[/dim]\n"
-                f"  Network or package index connectivity may be slow or temporarily constrained.\n\n"
-            )
-
-        stall_msg += (
+            f"[bold yellow]WARNING: No new Docker build output for {idle_min} minutes.[/bold yellow]\n"
+            f"No new output for {idle_sec} seconds.\n\n"
+            f"[bold]Current build step:[/bold]\n"
+            f"{current_step}\n\n"
+            f"Possible network/package index issue.\n"
+            f"Network or package index connectivity may be slow or temporarily constrained.\n\n"
+            f"[bold]Configured Python index:[/bold]\n"
+            f"{index_label}\n\n"
             f"[bold]To troubleshoot:[/bold]\n"
             f"  Inspect live logs: [bold cyan]deployx logs {self.project_name}[/bold cyan]\n"
             f"  Or rerun with:     [bold cyan]deployx deploy {self.project_name} --verbose[/bold cyan]"

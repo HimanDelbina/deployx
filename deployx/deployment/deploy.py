@@ -15,15 +15,20 @@ from typing import Optional
 from rich.console import Console
 from rich.panel import Panel
 
+import os
 from deployx.config import paths
 from deployx.core.command import CommandError, run_command
 from deployx.core.filesystem import ensure_directory
-from deployx.core.security import validate_project_name
+from deployx.core.security import redact_url_credentials, validate_project_name
 from deployx.deployment.health import perform_http_healthcheck
 from deployx.deployment.project import load_project_config
 from deployx.detectors.registry import detect_repository
 from deployx.docker.compose import DockerComposeManager
-from deployx.generators.django import generate_compose_file, generate_django_dockerfile
+from deployx.generators.django import (
+    generate_compose_file,
+    generate_django_dockerfile,
+    is_deployx_generated_file,
+)
 from deployx.generators.environment import generate_production_env
 from deployx.git.repository import GitRepositoryManager
 from deployx.logging.logger import ProjectLogger
@@ -38,11 +43,63 @@ from deployx.state import get_state_manager
 from deployx.ui.progress import DeploymentProgressReporter
 
 
+def resolve_build_environment(config: ProjectConfig) -> dict[str, str]:
+    """
+    Resolves build environment variables with priority:
+    os.environ > project config (build.python.*) > default (omitted/empty)
+    """
+    resolved: dict[str, str] = {}
+    py_build = getattr(getattr(config, "build", None), "python", None)
+
+    # PIP_INDEX_URL
+    if "PIP_INDEX_URL" in os.environ and os.environ["PIP_INDEX_URL"]:
+        resolved["PIP_INDEX_URL"] = os.environ["PIP_INDEX_URL"]
+    elif py_build and py_build.index_url:
+        resolved["PIP_INDEX_URL"] = py_build.index_url
+
+    # PIP_EXTRA_INDEX_URL
+    if "PIP_EXTRA_INDEX_URL" in os.environ and os.environ["PIP_EXTRA_INDEX_URL"]:
+        resolved["PIP_EXTRA_INDEX_URL"] = os.environ["PIP_EXTRA_INDEX_URL"]
+    elif py_build and py_build.extra_index_url:
+        resolved["PIP_EXTRA_INDEX_URL"] = py_build.extra_index_url
+
+    # PIP_TRUSTED_HOST
+    if "PIP_TRUSTED_HOST" in os.environ and os.environ["PIP_TRUSTED_HOST"]:
+        resolved["PIP_TRUSTED_HOST"] = os.environ["PIP_TRUSTED_HOST"]
+    elif py_build and py_build.trusted_host:
+        resolved["PIP_TRUSTED_HOST"] = py_build.trusted_host
+
+    return resolved
+
+
+def check_package_index_reachability(index_url: str, timeout: float = 3.0) -> tuple[bool, str]:
+    """
+    Performs a lightweight reachability check from the host to a custom Python package index.
+    Non-blocking: failures emit diagnostics and warnings but do not abort deployment.
+    """
+    import urllib.error
+    import urllib.request
+    safe_url = redact_url_credentials(index_url.strip())
+    try:
+        req = urllib.request.Request(
+            index_url.strip(),
+            headers={"User-Agent": "DeployX-Precheck"},
+            method="HEAD",
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return True, f"Reachable (status {resp.status})"
+    except urllib.error.HTTPError as exc:
+        return True, f"Host reached (HTTP {exc.code})"
+    except Exception as exc:
+        return False, str(exc)
+
+
 def run_deployment(
     project_name: str,
     target_commit: Optional[str] = None,
     verbose: bool = False,
     plain: bool = False,
+    regenerate: bool = False,
     console: Optional[Console] = None,
 ) -> bool:
     """
@@ -75,6 +132,10 @@ def run_deployment(
         reporter.start_stage(1, "Preflight checks & load configuration")
         try:
             config: ProjectConfig = load_project_config(valid_name)
+            build_env = resolve_build_environment(config)
+            pip_idx = build_env.get("PIP_INDEX_URL")
+            reporter.config = config
+            reporter.python_index = pip_idx
         except Exception as exc:
             from deployx.core.security import format_validation_error
             msg = (
@@ -166,22 +227,58 @@ def run_deployment(
         logger.info(f"Verified environment configuration at {env_file}")
 
         # 6b. Dockerfile (only if repository lacks one)
-        if not detection.infrastructure.has_dockerfile:
-            df_path = project_dir / "Dockerfile.deployx"
-            generate_django_dockerfile(config, detection, df_path)
-            logger.info(f"Generated Dockerfile at {df_path}")
+        if detection.infrastructure.has_dockerfile:
+            logger.info(
+                f"Preserving existing repository Dockerfile at {detection.infrastructure.dockerfile_path}"
+            )
         else:
-            logger.info(f"Preserving existing repository Dockerfile at {detection.infrastructure.dockerfile_path}")
+            df_path = project_dir / "Dockerfile.deployx"
+            if df_path.is_file():
+                if is_deployx_generated_file(df_path) or regenerate:
+                    generate_django_dockerfile(config, detection, df_path)
+                    logger.info(f"Refreshed DeployX Dockerfile at {df_path}")
+                else:
+                    logger.info(
+                        f"Preserving user-owned Dockerfile at {df_path} (missing DeployX marker)"
+                    )
+            else:
+                generate_django_dockerfile(config, detection, df_path)
+                logger.info(f"Generated Dockerfile at {df_path}")
 
         # 6c. Compose file (docker-compose.deployx.yml)
         compose_file = project_dir / "docker-compose.deployx.yml"
-        generate_compose_file(config, detection, image_tag, compose_file)
-        logger.info(f"Generated Docker Compose v2 manifest at {compose_file}")
+        if compose_file.is_file():
+            if is_deployx_generated_file(compose_file) or regenerate:
+                generate_compose_file(config, detection, image_tag, compose_file)
+                logger.info(f"Refreshed DeployX Docker Compose manifest at {compose_file}")
+            else:
+                logger.info(
+                    f"Preserving user-owned Compose file at {compose_file} (missing DeployX marker)"
+                )
+        else:
+            generate_compose_file(config, detection, image_tag, compose_file)
+            logger.info(f"Generated Docker Compose v2 manifest at {compose_file}")
 
         compose_mgr = DockerComposeManager(valid_name, compose_file=compose_file)
 
         # Stage 7: Docker build
         reporter.start_stage(7, f"Building Docker image ({image_tag})")
+
+        # Optional lightweight reachability check for custom package index
+        if pip_idx:
+            reachable, reason = check_package_index_reachability(pip_idx)
+            safe_idx = redact_url_credentials(pip_idx)
+            if reachable:
+                logger.info(f"Package index precheck passed: {safe_idx} ({reason})")
+            else:
+                logger.warning(
+                    f"Host precheck warning: Custom package index '{safe_idx}' could not be reached from host: {reason}"
+                )
+                if console:
+                    console.print(
+                        f"[dim yellow]Notice: Host precheck could not reach '{safe_idx}' ({reason}). Proceeding with build...[/dim yellow]"
+                    )
+
         logger.info(f"Executing: docker compose build web")
         compose_mgr.build(
             service="web",
@@ -190,6 +287,7 @@ def run_deployment(
             on_heartbeat=reporter.on_heartbeat,
             on_stall=reporter.on_stall,
             log_file=deploy_log_file,
+            env=build_env,
         )
 
         # Stage 8: Spin up supporting infrastructure (PostgreSQL / Redis)

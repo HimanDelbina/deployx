@@ -38,6 +38,7 @@ class DockerComposeManager:
         on_stall: Optional[Any] = None,
         log_file: Optional[Path | str] = None,
         timeout: int = 1200,
+        env: Optional[dict[str, str]] = None,
     ) -> CommandResult:
         """
         Runs 'docker compose build' with BuildKit plain progress output.
@@ -54,7 +55,10 @@ class DockerComposeManager:
         build_env = {
             "DOCKER_BUILDKIT": "1",
             "BUILDKIT_PROGRESS": "plain",
+            "PROGRESS_NO_TRUNC": "1",
         }
+        if env:
+            build_env.update(env)
 
         if stream:
             return run_command_streaming(

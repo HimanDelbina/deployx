@@ -23,6 +23,7 @@ def run_update(
     project_name: str,
     verbose: bool = False,
     plain: bool = False,
+    regenerate: bool = False,
     console: Optional[Console] = None,
 ) -> bool:
     """
@@ -133,4 +134,6 @@ def run_update(
         deploy_kwargs["verbose"] = True
     if plain:
         deploy_kwargs["plain"] = True
+    if regenerate:
+        deploy_kwargs["regenerate"] = True
     return run_deployment(valid_name, target_commit=remote_sha, **deploy_kwargs)

@@ -58,6 +58,11 @@ class SystemPaths:
         target = self.projects_dir / valid_name
         return prevent_path_traversal(self.projects_dir, target)
 
+    def get_project_repo_dir(self, project_name: str) -> Path:
+        pdir = self.get_project_dir(project_name)
+        target = pdir / "repo"
+        return prevent_path_traversal(pdir, target)
+
     def get_project_config_path(self, project_name: str) -> Path:
         pdir = self.get_project_dir(project_name)
         return pdir / "deployx.yml"
