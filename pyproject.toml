@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "deployx"
-version = "0.1.1"
+version = "0.1.2"
 description = "Production-Grade Deployment Manager for Ubuntu Linux servers with Docker & Docker Compose"
 readme = "README.md"
 requires-python = ">=3.10"

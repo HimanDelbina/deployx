@@ -5,6 +5,24 @@ All notable changes to DeployX are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.2] - 2026-09-29
+
+### Added
+- **Project Rename (`deployx project rename <old> <new>`)**: Safe pre-deployment project renaming across filesystem, `deployx.yml`, persistent state, and SSH deploy keys. Strictly guards against renaming deployed projects to avoid container and volume drift.
+- **Interactive & Flag-Based Project Editing (`deployx project edit`)**: Supports interactive editor fallback when no flags are given, displays a side-by-side configuration diff preview panel, re-validates all fields before committing, and provides deployed project redeployment guidance.
+- **Repository Verification Invalidation & Transition**: Changing repository URL, branch, or privacy mode automatically invalidates prior verification. Seamlessly handles Public-to-Private transitions (instructions to generate key) and Private-to-Public transitions (re-verifies via `git ls-remote` while safely preserving existing SSH keys).
+- **Three-Tier Project Removal (`deployx project remove`)**:
+  - *Tier A (Safe unregister, default)*: Removes project registration and state; completely preserves running containers, Docker volumes, backups, and SSH keys.
+  - *Tier B (Runtime purge, `--purge`)*: Stops and removes project containers and networks; preserves Docker volumes, database data, backups, and SSH keys.
+  - *Tier C (Destructive volume deletion, `--purge --delete-volumes`)*: Destructive volume removal requiring project name typing in interactive mode or `--yes` in non-interactive mode. Backups and SSH keys remain preserved.
+- **Explicit Deploy Key Removal (`deployx key remove <project>`)**: Project removal preserves SSH deploy keys by default. Keys can only be deleted via explicit confirmation with `deployx key remove`.
+- **Duplicate Project & Conflict Protection**: `deployx project add` prevents duplicate project registrations and conflicting filesystem directories, directing users to `deployx project edit`.
+- **Project Name Security & Path Traversal Guards**: Strictly rejects path traversal characters (`..`, `/`, `\`, `~`), spaces, shell metacharacters, and reserved system directory names (`keys`, `backups`, `logs`, `state`, `system`, etc.).
+- **Expanded Project Info**: `deployx project info` displays `Created At`, `Updated At`, `Deploy Key Status`, and complete deployment state.
+- **Audit Logging**: Logs all project additions, edits, renames, removals, and verification state transitions.
+
+---
+
 ## [0.1.1] - 2026-09-29
 
 ### Fixed

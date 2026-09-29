@@ -431,6 +431,13 @@ def test_project_remove_with_purge(mocker):
     res = runner.invoke(app, ["project", "remove", "purge-app", "--purge", "--force"])
     assert res.exit_code == 0
     assert not project_exists("purge-app")
+    # Under v0.1.2 requirement 9, deploy keys are preserved by default even under --purge
+    assert key_path.exists()
+    assert pub_path.exists()
+
+    # Key removal requires explicit key remove command
+    key_res = runner.invoke(app, ["key", "remove", "purge-app", "--force"])
+    assert key_res.exit_code == 0
     assert not key_path.exists()
     assert not pub_path.exists()
 
@@ -458,6 +465,7 @@ def test_project_edit_command(mocker):
             "--branch", "develop",
             "--domain", "portal.acme.com",
             "--database", "sqlite",
+            "--yes",
         ],
     )
     assert res.exit_code == 0

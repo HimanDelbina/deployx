@@ -98,14 +98,25 @@ def project_add(
 @project_app.command("remove")
 def project_remove(
     project: str = typer.Argument(..., help="Project name to remove"),
-    purge: bool = typer.Option(False, "--purge", help="Also remove deploy keys and Docker resources"),
+    purge: bool = typer.Option(False, "--purge", help="Stop and remove Docker containers and networks"),
+    delete_volumes: bool = typer.Option(False, "--delete-volumes", help="Permanently delete project Docker volumes (requires --purge)"),
     force: bool = typer.Option(False, "--force", "-f", help="Skip confirmation prompt"),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Confirm destructive volume deletion in non-interactive mode"),
+    non_interactive: bool = typer.Option(False, "--non-interactive", help="Run without interactive confirmation prompts"),
 ):
     """
     Safely remove a registered project and its configuration.
     """
     from deployx.deployment.project import remove_project
-    success = remove_project(project_name=project, purge=purge, force=force, console=console)
+    success = remove_project(
+        project_name=project,
+        purge=purge,
+        delete_volumes=delete_volumes,
+        force=force,
+        yes=yes,
+        non_interactive=non_interactive,
+        console=console,
+    )
     if not success:
         raise typer.Exit(1)
 
@@ -115,9 +126,17 @@ def project_edit(
     project: str = typer.Argument(..., help="Project name to edit"),
     git: Optional[str] = typer.Option(None, "--git", "-g", help="New Git repository URL"),
     branch: Optional[str] = typer.Option(None, "--branch", "-b", help="New Git branch"),
+    private: Optional[bool] = typer.Option(None, "--private", help="Mark repository as private"),
+    public: Optional[bool] = typer.Option(None, "--public", help="Mark repository as public"),
     domain: Optional[str] = typer.Option(None, "--domain", "-d", help="New custom domain"),
+    no_domain: bool = typer.Option(False, "--no-domain", help="Remove custom domain"),
     framework: Optional[str] = typer.Option(None, "--framework", "-f", help="New framework"),
     database: Optional[str] = typer.Option(None, "--database", help="New database preference"),
+    port: Optional[int] = typer.Option(None, "--port", help="New external port"),
+    redis: Optional[bool] = typer.Option(None, "--redis/--no-redis", help="Toggle Redis container"),
+    worker: Optional[bool] = typer.Option(None, "--worker/--no-worker", help="Toggle Celery/RQ background worker"),
+    non_interactive: bool = typer.Option(False, "--non-interactive", help="Disable interactive prompts"),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Apply changes without confirmation"),
 ):
     """
     Edit configuration of an existing project.
@@ -128,10 +147,42 @@ def project_edit(
         git=git,
         branch=branch,
         domain=domain,
+        no_domain=no_domain,
+        private=private,
+        public=public,
         framework=framework,
         database=database,
+        port=port,
+        redis=redis,
+        worker=worker,
+        non_interactive=non_interactive,
+        yes=yes,
         console=console,
     )
+
+
+@project_app.command("rename")
+def project_rename(
+    old_name: str = typer.Argument(..., help="Current project name"),
+    new_name: str = typer.Argument(..., help="New project name"),
+    force: bool = typer.Option(False, "--force", "-f", help="Skip confirmation prompt"),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Confirm rename"),
+    non_interactive: bool = typer.Option(False, "--non-interactive", help="Run without interactive prompts"),
+):
+    """
+    Safely rename an undeployed project across filesystem, configs, and keys.
+    """
+    from deployx.deployment.project import rename_project
+    success = rename_project(
+        old_name=old_name,
+        new_name=new_name,
+        force=force,
+        yes=yes,
+        non_interactive=non_interactive,
+        console=console,
+    )
+    if not success:
+        raise typer.Exit(1)
 
 
 @project_app.command("list")
@@ -183,6 +234,22 @@ def key_verify(project: str = typer.Argument(..., help="Project name")):
     """
     from deployx.git.ssh import verify_deploy_key
     verify_deploy_key(project, console=console)
+
+
+@key_app.command("remove")
+def key_remove(
+    project: str = typer.Argument(..., help="Project name"),
+    force: bool = typer.Option(False, "--force", "-f", help="Skip confirmation prompt"),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Confirm removal"),
+):
+    """
+    Remove SSH deploy key for a project.
+    """
+    from deployx.git.ssh import remove_deploy_key
+    success = remove_deploy_key(project, force=(force or yes), console=console)
+    if not success:
+        raise typer.Exit(1)
+
 
 
 # ----------------------------------------------------------------------

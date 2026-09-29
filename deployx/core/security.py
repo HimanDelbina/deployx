@@ -111,14 +111,41 @@ def detect_git_url_placeholders(url: str) -> list[str]:
     return detected
 
 
+RESERVED_PROJECT_NAMES = {
+    ".",
+    "..",
+    "root",
+    "default",
+    "system",
+    "keys",
+    "backups",
+    "logs",
+    "state",
+    "generated",
+    "venv",
+    "all",
+    "none",
+    "config",
+    "tmp",
+    "etc",
+    "bin",
+    "opt",
+    "usr",
+    "var",
+    "dev",
+    "run",
+    "lib",
+}
+
+
 def validate_project_name(name: str) -> str:
     """
     Validates project name against safe naming rules:
     - 2 to 63 characters
     - Must start with an alphanumeric character
-    - May contain alphanumeric characters, underscores, and hyphens
-    - Prevents command injection and path traversal
-    - Rejects obvious placeholder names
+    - May contain alphanumeric characters, underscores, dots, and hyphens
+    - Strictly forbids path traversal characters (/, \\, ~, ..)
+    - Rejects reserved system names and obvious placeholders
     """
     if not isinstance(name, str):
         raise SecurityError("Project name must be a string.")
@@ -127,14 +154,20 @@ def validate_project_name(name: str) -> str:
     if not clean_name:
         raise SecurityError("Project name cannot be empty.")
     
+    # Path traversal and dangerous character check
+    if ".." in clean_name or "/" in clean_name or "\\" in clean_name or "~" in clean_name:
+        raise SecurityError(
+            f"Invalid project name '{name}'. Path traversal characters (/, \\, ~, ..) are strictly forbidden."
+        )
+    
     if not PROJECT_NAME_REGEX.match(clean_name):
         raise SecurityError(
             f"Invalid project name '{name}'. Must be 2-63 chars, start with a letter or digit, "
-            "and only contain letters, digits, dashes, and underscores."
+            "and only contain letters, digits, dashes, dots, and underscores."
         )
     
     # Explicit check for reserved words or path symbols
-    if clean_name in {".", "..", "root", "default", "system"}:
+    if clean_name.lower() in RESERVED_PROJECT_NAMES:
         raise SecurityError(f"Project name '{name}' is reserved and cannot be used.")
     
     # Check for placeholder names

@@ -1,4 +1,4 @@
-# DeployX (v0.1.1)
+# DeployX (v0.1.2)
 
 > **Production-Grade Autonomous Deployment Manager for Ubuntu Linux servers (22.04 / 24.04 LTS).**  
 > Effortlessly register, verify, deploy, and incrementally update public and private GitHub projects using Docker and Docker Compose v2 with zero host bloat.
@@ -238,17 +238,50 @@ Supported edit flags:
 - `--worker / --no-worker`: Toggle background Celery/RQ worker.
 
 ### Safe Project Removal
-Safely remove a project from DeployX registration:
+DeployX provides three distinct tiers of project removal, prioritizing data safety:
+
 ```bash
-# Non-destructive metadata removal (preserves containers, volumes, and deploy keys):
+# Tier A: Default Safe Unregister
+# Removes project configuration and state from DeployX.
+# Containers, Docker volumes, backups, and SSH deploy keys are completely preserved!
 deployx project remove my-django-app
 
-# Complete purge (stops & removes containers, deletes volumes and SSH keys):
+# Tier B: Runtime Purge
+# Stops and removes project containers and networks.
+# Docker volumes, database data, backups, and SSH keys are NOT deleted!
 deployx project remove my-django-app --purge
 
-# Force removal without interactive confirmation prompt (for scripts):
+# Tier C: Destructive Volume Deletion
+# Stops containers AND permanently deletes project Docker volumes and database data.
+# In interactive mode, prompts to type project name for confirmation.
+# Backups and SSH deploy keys are STILL preserved!
+deployx project remove my-django-app --purge --delete-volumes
+
+# Scripting / Non-Interactive Removal:
+# Safe unregister without interactive prompts:
 deployx project remove my-django-app --force
+# Purge runtime containers without prompts:
 deployx project remove my-django-app --purge --force
+# Destructive volume deletion in non-interactive mode (requires explicit --yes):
+deployx project remove my-django-app --purge --delete-volumes --non-interactive --yes
+```
+
+### Pre-Deployment Project Renaming
+Safely rename an undeployed project across filesystem directory paths, `deployx.yml`, persistent state, and SSH deploy keys:
+
+```bash
+deployx project rename old-app-name new-app-name
+```
+- **Safety Rule**: If a project has already been deployed, DeployX halts and prevents renaming (`Project rename is currently supported only before first deployment`) to prevent container, network, and persistent volume drift.
+- **Key Material Protection**: Renaming migrates keys to `/opt/deployx/keys/<new-name>` and preserves permissions (`0600`/`0644`) without altering key contents.
+
+### Dedicated SSH Deploy Key Removal
+Deploy keys are never deleted automatically during `deployx project remove`. To explicitly delete an SSH key pair:
+
+```bash
+deployx key remove my-django-app
+# Skip confirmation prompt in automated scripts:
+deployx key remove my-django-app --force
 ```
 
 ---
@@ -289,10 +322,12 @@ deployx update my-django-app
 | `deployx project list` | Lists all registered projects with branch, commit, and verification status |
 | `deployx project info <project>` | Displays complete project metadata, paths, and deployment state |
 | `deployx project edit <project>` | Safely updates project configuration parameters with re-validation |
-| `deployx project remove <project>` | Removes project metadata safely; supports `--purge` and `--force` |
+| `deployx project rename <old> <new>` | Safely renames an undeployed project across filesystem and keys |
+| `deployx project remove <project>` | Removes project metadata safely; supports `--purge` and `--delete-volumes` |
 | `deployx key create <project>` | Generates dedicated ED25519 deploy key (preserves existing unless `--force`) |
 | `deployx key show <project>` | Displays public SSH deploy key |
 | `deployx key verify <project>` | Tests SSH authentication against remote repository & verifies branch |
+| `deployx key remove <project>` | Explicitly removes SSH deploy key pair with confirmation |
 | `deployx deploy <project>` | Builds, provisions, and deploys the project |
 | `deployx update <project>` | Performs zero-drift, SHA-checked incremental update |
 | `deployx status <project>` | Inspects live container statuses and healthcheck state |

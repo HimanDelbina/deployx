@@ -255,3 +255,53 @@ def verify_deploy_key(project_name: str, console: Optional[Console] = None) -> b
                 )
             )
         return False
+
+
+def remove_deploy_key(
+    project_name: str,
+    force: bool = False,
+    console: Optional[Console] = None,
+) -> bool:
+    """
+    Safely removes the SSH deploy key pair for a project.
+    Prompts for confirmation unless force=True.
+    """
+    import sys
+    from rich.prompt import Confirm
+    from deployx.logging.logger import ProjectLogger
+
+    valid_name = validate_project_name(project_name)
+    key_path = paths.get_project_key_path(valid_name)
+    pub_path = paths.get_project_pubkey_path(valid_name)
+
+    if not key_path.exists() and not pub_path.exists():
+        if console:
+            console.print(f"[bold yellow]No deploy key found for project '{valid_name}'.[/bold yellow]")
+        return False
+
+    if not force:
+        if console:
+            console.print(f"Deploy key found at: {key_path}")
+        if sys.stdin.isatty():
+            confirmed = Confirm.ask(f"Remove SSH deploy key for project '{valid_name}'?", default=False)
+            if not confirmed:
+                if console:
+                    console.print("[dim]Key removal cancelled.[/dim]")
+                return False
+        else:
+            if console:
+                console.print("[bold red]Error:[/bold red] Key removal in non-interactive mode requires --force or --yes.")
+            return False
+
+    key_path.unlink(missing_ok=True)
+    pub_path.unlink(missing_ok=True)
+
+    try:
+        ProjectLogger(valid_name).info(f"SSH deploy key removed for project '{valid_name}'")
+    except Exception:
+        pass
+
+    if console:
+        console.print(f"[bold green]Deploy key for '{valid_name}' successfully removed.[/bold green]")
+    return True
+

@@ -50,6 +50,8 @@ class HealthStatus(str, Enum):
 
 class ProjectMeta(BaseModel):
     name: str
+    created_at: str | None = None
+    updated_at: str | None = None
 
     @field_validator("name")
     @classmethod
@@ -139,6 +141,8 @@ class DeploymentState(BaseModel):
     current_commit: str | None = None
     previous_commit: str | None = None
     deployed_at: str | None = None
+    created_at: str | None = None
+    updated_at: str | None = None
     docker_image: str | None = None
     status: DeploymentStatus = DeploymentStatus.PENDING
     health_status: HealthStatus = HealthStatus.UNKNOWN
@@ -146,9 +150,12 @@ class DeploymentState(BaseModel):
 
     @classmethod
     def new(cls, project: str, repository: str, branch: str) -> DeploymentState:
+        now_iso = datetime.now(timezone.utc).isoformat()
         return cls(
             project=project,
             repository=repository,
             branch=branch,
-            deployed_at=datetime.now(timezone.utc).isoformat(),
+            deployed_at=None,
+            created_at=now_iso,
+            updated_at=now_iso,
         )
