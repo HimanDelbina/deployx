@@ -11,8 +11,9 @@ import shutil
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
+import yaml
 from rich.console import Console
 from rich.panel import Panel
 from rich.prompt import Confirm, Prompt
@@ -23,6 +24,7 @@ from deployx.core.command import run_command
 from deployx.core.filesystem import atomic_write_file, ensure_directory, set_secure_permissions
 from deployx.core.security import (
     SecurityError,
+    format_validation_error,
     validate_domain,
     validate_git_url,
     validate_project_name,
@@ -44,7 +46,7 @@ from deployx.state import get_state_manager
 
 
 def project_exists(project_name: str) -> bool:
-    """Checks whether a project configuration exists."""
+    """Checks whether a project configuration file exists on disk."""
     try:
         config_file = paths.get_project_config_path(project_name)
         return config_file.is_file()
@@ -52,17 +54,92 @@ def project_exists(project_name: str) -> bool:
         return False
 
 
-def load_project_config(project_name: str) -> ProjectConfig:
+def load_project_raw(project_name: str) -> dict[str, Any]:
     """
-    Loads and validates deployx.yml for a given project.
-    Raises FileNotFoundError or ValueError if invalid.
+    Safely loads the raw dictionary structure from deployx.yml for a given project.
+    - Validates project name for path traversal
+    - Checks file existence
+    - Parses YAML safely
+    - Verifies root structure is a dictionary
+    - Does NOT perform Pydantic business/schema validation.
+
+    Raises FileNotFoundError if project or deployx.yml does not exist.
+    Raises ValueError if YAML is malformed or root is not a dictionary.
     """
-    config_file = paths.get_project_config_path(project_name)
+    valid_name = validate_project_name(project_name)
+    config_file = paths.get_project_config_path(valid_name)
     if not config_file.is_file():
         raise FileNotFoundError(
-            f"Project '{project_name}' is not registered. (Config not found at {config_file})"
+            f"Project '{valid_name}' is not registered. (Config not found at {config_file})"
         )
-    return ProjectConfig.from_yaml(config_file.read_text(encoding="utf-8"))
+
+    try:
+        content = config_file.read_text(encoding="utf-8")
+        raw_data = yaml.safe_load(content)
+    except yaml.YAMLError as exc:
+        raise ValueError(f"Malformed YAML configuration in {config_file}: {exc}") from exc
+    except Exception as exc:
+        raise ValueError(f"Failed to read project config at {config_file}: {exc}") from exc
+
+    if not isinstance(raw_data, dict):
+        raise ValueError(
+            f"Invalid configuration in {config_file}: Root YAML structure must be a dictionary."
+        )
+
+    return raw_data
+
+
+def load_project_config(project_name: str) -> ProjectConfig:
+    """
+    Loads and validates deployx.yml for a given project into a strict ProjectConfig model.
+    Raises FileNotFoundError, ValidationError, or ValueError if invalid.
+    """
+    raw_data = load_project_raw(project_name)
+    return ProjectConfig.model_validate(raw_data)
+
+
+class ProjectConfigInspection:
+    """Inspection container holding validation diagnostics and raw/validated models."""
+    def __init__(
+        self,
+        valid: bool,
+        config: Optional[ProjectConfig] = None,
+        raw_data: Optional[dict[str, Any]] = None,
+        error_message: Optional[str] = None,
+    ):
+        self.valid = valid
+        self.config = config
+        self.raw_data = raw_data or {}
+        self.error_message = error_message
+
+
+def inspect_project_config(project_name: str) -> ProjectConfigInspection:
+    """
+    Safely inspects a project config without raising unhandled validation exceptions.
+    Returns ProjectConfigInspection with valid=True/False and detailed diagnostics.
+    """
+    try:
+        raw_data = load_project_raw(project_name)
+    except Exception as exc:
+        return ProjectConfigInspection(
+            valid=False,
+            raw_data=None,
+            error_message=str(exc),
+        )
+
+    try:
+        cfg = ProjectConfig.model_validate(raw_data)
+        return ProjectConfigInspection(
+            valid=True,
+            config=cfg,
+            raw_data=raw_data,
+        )
+    except Exception as exc:
+        return ProjectConfigInspection(
+            valid=False,
+            raw_data=raw_data,
+            error_message=format_validation_error(exc),
+        )
 
 
 def verify_public_repository(repo_url: str, branch: str) -> str:
@@ -269,13 +346,18 @@ def add_project(
 def list_projects(console: Console) -> None:
     """
     Lists all registered projects, verification state, and deployment status.
+    Never silently hides projects whose configuration contains validation errors;
+    displays them with INVALID_CONFIG status so administrators can inspect or repair them.
     """
     projects_dir = paths.projects_dir
-    if not projects_dir.exists():
-        console.print("[dim]No projects registered yet. Run 'deployx project add' to register one.[/dim]")
-        return
+    try:
+        if not projects_dir.exists():
+            console.print("[dim]No projects registered yet. Run 'deployx project add' to register one.[/dim]")
+            return
+        subdirs = [p for p in projects_dir.iterdir() if p.is_dir()]
+    except PermissionError as exc:
+        raise PermissionError(str(projects_dir)) from exc
 
-    subdirs = [p for p in projects_dir.iterdir() if p.is_dir()]
     if not subdirs:
         console.print("[dim]No projects registered yet. Run 'deployx project add' to register one.[/dim]")
         return
@@ -286,7 +368,7 @@ def list_projects(console: Console) -> None:
     table.add_column("Branch")
     table.add_column("Private")
     table.add_column("Verified")
-    table.add_column("Status")
+    table.add_column("Status", no_wrap=True)
     table.add_column("Commit")
     table.add_column("Repository", style="white")
 
@@ -298,9 +380,12 @@ def list_projects(console: Console) -> None:
         if not cfg_file.is_file():
             continue
 
-        try:
-            cfg = ProjectConfig.from_yaml(cfg_file.read_text(encoding="utf-8"))
-            found += 1
+        found += 1
+        proj_name = pdir.name
+        inspection = inspect_project_config(proj_name)
+
+        if inspection.valid and inspection.config:
+            cfg = inspection.config
             state = state_mgr.get_state(cfg.project.name)
             commit = (state.current_commit[:7]) if (state and state.current_commit) else "-"
             status = state.status.value if state else "registered"
@@ -330,8 +415,35 @@ def list_projects(console: Console) -> None:
                 commit,
                 repo_display,
             )
-        except Exception:
-            continue
+        else:
+            # Broken / Invalid Project Configuration
+            raw = inspection.raw_data or {}
+            raw_git = raw.get("git", {}) if isinstance(raw.get("git"), dict) else {}
+            raw_dep = raw.get("deployment", {}) if isinstance(raw.get("deployment"), dict) else {}
+            raw_proj = raw.get("project", {}) if isinstance(raw.get("project"), dict) else {}
+
+            name_display = raw_proj.get("name") or proj_name
+            fw_display = raw_dep.get("framework") or "?"
+            branch_display = raw_git.get("branch") or "?"
+            private_val = raw_git.get("private")
+            private_display = "Yes" if private_val is True else ("No" if private_val is False else "?")
+            verified_display = "[yellow]No[/yellow]"
+            status_fmt = "[bold red]INVALID_CONFIG[/bold red]"
+            commit = "-"
+            repo_display = raw_git.get("repository") or "[red]<invalid>[/red]"
+            if len(repo_display) > 36:
+                repo_display = repo_display[:33] + "..."
+
+            table.add_row(
+                str(name_display),
+                str(fw_display),
+                str(branch_display),
+                private_display,
+                verified_display,
+                status_fmt,
+                commit,
+                repo_display,
+            )
 
     if found == 0:
         console.print("[dim]No projects registered yet. Run 'deployx project add' to register one.[/dim]")
@@ -343,13 +455,41 @@ def list_projects(console: Console) -> None:
 def show_project_info(project: str, console: Console) -> None:
     """
     Displays detailed configuration, paths, and deployment metadata for a project.
+    Catches and formats invalid configurations cleanly without raw tracebacks.
     """
     try:
         valid_name = validate_project_name(project)
-        cfg = load_project_config(valid_name)
-    except (SecurityError, FileNotFoundError) as exc:
+    except SecurityError as exc:
         console.print(f"[bold red]Error:[/bold red] {exc}")
         raise SystemExit(1)
+
+    if not project_exists(valid_name) and not paths.get_project_dir(valid_name).exists():
+        console.print(f"[bold red]Error:[/bold red] Project '{valid_name}' is not registered.")
+        raise SystemExit(1)
+
+    inspection = inspect_project_config(valid_name)
+    if not inspection.valid:
+        # Invalid project configuration - clean diagnostic display
+        raw = inspection.raw_data or {}
+        raw_git = raw.get("git", {}) if isinstance(raw.get("git"), dict) else {}
+        repo_val = raw_git.get("repository", "Unknown / Invalid")
+        config_path = paths.get_project_config_path(valid_name)
+
+        panel_content = (
+            f"[bold red]Project '{valid_name}' exists but its configuration is invalid.[/bold red]\n\n"
+            f"[bold]Status:[/bold]            [bold red]INVALID_CONFIG[/bold red]\n"
+            f"[bold]Config Path:[/bold]       {config_path}\n"
+            f"[bold]Repository:[/bold]        {repo_val}\n\n"
+            f"[bold red]Validation errors:[/bold red]\n{inspection.error_message}\n\n"
+            f"[bold yellow]Actionable advice:[/bold yellow]\n"
+            f"  - Edit the configuration to fix it: [bold cyan]deployx project edit {valid_name} --git <valid_repository>[/bold cyan]\n"
+            f"  - Or remove the project:            [bold cyan]deployx project remove {valid_name}[/bold cyan]"
+        )
+        console.print(Panel(panel_content, title=f"Invalid Project Config: {valid_name}", border_style="red"))
+        return
+
+    cfg = inspection.config
+    assert cfg is not None
 
     state_mgr = get_state_manager()
     state = state_mgr.get_state(valid_name)
@@ -409,6 +549,7 @@ def remove_project(
 ) -> bool:
     """
     Safely removes project registration from DeployX.
+    Works reliably even if the project's configuration file is invalid or malformed.
     Modes:
       1. Default (Safe unregister):
          Removes project metadata and state.
@@ -432,14 +573,22 @@ def remove_project(
 
     state_mgr = get_state_manager()
     state = state_mgr.get_state(valid_name)
+
     cfg = None
-    if project_exists(valid_name):
+    raw_data = None
+    if project_exists(valid_name) or paths.get_project_dir(valid_name).exists():
         try:
             cfg = load_project_config(valid_name)
         except Exception:
             pass
 
-    if cfg is None and state is None and not paths.get_project_dir(valid_name).exists():
+        if cfg is None:
+            try:
+                raw_data = load_project_raw(valid_name)
+            except Exception:
+                pass
+
+    if cfg is None and raw_data is None and state is None and not paths.get_project_dir(valid_name).exists():
         console.print(f"[bold red]Error:[/bold red] Project '{valid_name}' is not registered.")
         return False
 
@@ -447,8 +596,15 @@ def remove_project(
     if delete_volumes:
         purge = True
 
-    # Display Project Identity before confirmation
-    repo = cfg.git.repository if cfg else (state.repository if state else "Unknown")
+    # Display Project Identity before confirmation (best-effort)
+    repo = "Unknown"
+    if cfg:
+        repo = cfg.git.repository
+    elif raw_data and isinstance(raw_data.get("git"), dict):
+        repo = raw_data["git"].get("repository", "Invalid / Legacy")
+    elif state:
+        repo = state.repository
+
     status_val = state.status.value if state else "not deployed"
 
     console.print(
@@ -456,6 +612,9 @@ def remove_project(
         f"[bold]Deployment status:[/bold] {status_val}\n"
         f"[bold]Repository:[/bold]        {repo}\n"
     )
+
+    if cfg is None and (raw_data is not None or paths.get_project_config_path(valid_name).exists()):
+        console.print("[bold yellow]Warning: Project configuration is invalid.[/bold yellow]")
 
     # Confirmation depending on mode
     if delete_volumes:
@@ -568,17 +727,38 @@ def edit_project(
 ) -> ProjectConfig:
     """
     Safely edits configuration fields of an existing project and validates all changes.
-    Invalidates previous verification if repository, branch, or private status changes.
+    Supports repairing broken/invalid legacy configurations without requiring the old config
+    to pass validation upfront.
     """
     if console is None:
         console = Console()
 
     try:
         valid_name = validate_project_name(project_name)
-        cfg = load_project_config(valid_name)
-    except (SecurityError, FileNotFoundError) as exc:
+    except SecurityError as exc:
         console.print(f"[bold red]Error:[/bold red] {exc}")
         raise SystemExit(1)
+
+    if not project_exists(valid_name) and not paths.get_project_dir(valid_name).exists():
+        console.print(f"[bold red]Error:[/bold red] Project '{valid_name}' is not registered.")
+        raise SystemExit(1)
+
+    # Load existing config or fallback to raw YAML for recovery
+    cfg = None
+    raw_data = None
+    try:
+        cfg = load_project_config(valid_name)
+    except Exception as exc:
+        try:
+            raw_data = load_project_raw(valid_name)
+            console.print(
+                f"[bold yellow]Warning:[/bold yellow] Project '{valid_name}' configuration is currently invalid:\n"
+                f"  {format_validation_error(exc)}\n"
+                "[dim]Applying new configuration parameters will repair it.[/dim]\n"
+            )
+        except Exception as raw_exc:
+            console.print(f"[bold red]Error reading project config:[/bold red] {raw_exc}")
+            raise SystemExit(1)
 
     state_mgr = get_state_manager()
     state = state_mgr.get_state(valid_name)
@@ -590,6 +770,35 @@ def edit_project(
     if private is True and public is True:
         console.print("[bold red]Error:[/bold red] Cannot specify both --private and --public.")
         raise SystemExit(1)
+
+    # Extract current parameters
+    if cfg is not None:
+        current_repo = cfg.git.repository
+        current_branch = cfg.git.branch
+        current_private = cfg.git.private
+        current_domain = cfg.deployment.domain
+        current_framework_str = cfg.deployment.framework.value
+        current_database_str = cfg.deployment.database.value
+        current_port = cfg.deployment.docker.port
+        current_redis = cfg.deployment.redis
+        current_worker = cfg.deployment.celery
+        current_created_at = getattr(cfg.project, "created_at", None)
+    else:
+        raw_git = raw_data.get("git", {}) if isinstance(raw_data.get("git"), dict) else {}
+        raw_dep = raw_data.get("deployment", {}) if isinstance(raw_data.get("deployment"), dict) else {}
+        raw_proj = raw_data.get("project", {}) if isinstance(raw_data.get("project"), dict) else {}
+        raw_docker = raw_dep.get("docker", {}) if isinstance(raw_dep.get("docker"), dict) else {}
+
+        current_repo = str(raw_git.get("repository", ""))
+        current_branch = str(raw_git.get("branch", "main"))
+        current_private = bool(raw_git.get("private", False))
+        current_domain = raw_dep.get("domain", None)
+        current_framework_str = str(raw_dep.get("framework", "django"))
+        current_database_str = str(raw_dep.get("database", "postgres"))
+        current_port = int(raw_docker.get("port", 8000))
+        current_redis = bool(raw_dep.get("redis", False))
+        current_worker = bool(raw_dep.get("celery", False))
+        current_created_at = raw_proj.get("created_at", None)
 
     flags_provided = (
         git is not None
@@ -609,20 +818,23 @@ def edit_project(
     if not flags_provided:
         if non_interactive or not sys.stdin.isatty():
             console.print("[dim]No changes specified for project configuration.[/dim]")
-            return cfg
+            if cfg is not None:
+                return cfg
+            console.print(f"Run 'deployx project edit {valid_name} --git <url>' to fix invalid fields.")
+            raise SystemExit(1)
 
         console.print(f"\n[bold cyan]Interactive Project Editor for '{valid_name}':[/bold cyan]")
-        interactive_git = Prompt.ask("Repository URL", default=cfg.git.repository)
-        interactive_branch = Prompt.ask("Branch", default=cfg.git.branch)
-        interactive_private = Confirm.ask("Private repository?", default=cfg.git.private)
-        interactive_domain = Prompt.ask("Custom domain (leave empty to unset)", default=cfg.deployment.domain or "")
+        interactive_git = Prompt.ask("Repository URL", default=current_repo)
+        interactive_branch = Prompt.ask("Branch", default=current_branch)
+        interactive_private = Confirm.ask("Private repository?", default=current_private)
+        interactive_domain = Prompt.ask("Custom domain (leave empty to unset)", default=current_domain or "")
         interactive_framework = Prompt.ask(
             "Framework (django/fastapi/flask/node/custom)",
-            default=cfg.deployment.framework.value,
+            default=current_framework_str,
         )
         interactive_database = Prompt.ask(
             "Database (postgres/sqlite/mysql/none)",
-            default=cfg.deployment.database.value,
+            default=current_database_str,
         )
 
         git = interactive_git
@@ -635,13 +847,13 @@ def edit_project(
         database = interactive_database
 
     # Resolve target candidate values
-    target_private = cfg.git.private
+    target_private = current_private
     if private is True:
         target_private = True
     elif public is True:
         target_private = False
 
-    target_git = cfg.git.repository
+    target_git = current_repo
     if git is not None:
         try:
             target_git = validate_git_url(git, check_placeholders=True)
@@ -651,7 +863,7 @@ def edit_project(
         if target_git.startswith("git@") and public is not True:
             target_private = True
 
-    target_branch = cfg.git.branch
+    target_branch = current_branch
     if branch is not None:
         branch_clean = branch.strip()
         if not branch_clean or branch_clean.startswith("-") or ".." in branch_clean:
@@ -659,7 +871,7 @@ def edit_project(
             raise SystemExit(1)
         target_branch = branch_clean
 
-    target_domain = cfg.deployment.domain
+    target_domain = current_domain
     if no_domain:
         target_domain = None
     elif domain is not None:
@@ -669,59 +881,76 @@ def edit_project(
             console.print(f"[bold red]Validation Error:[/bold red] {exc}")
             raise SystemExit(1)
 
-    target_framework = cfg.deployment.framework
+    target_framework_str = current_framework_str
     if framework is not None:
         try:
-            target_framework = FrameworkType(framework.lower())
+            target_framework_enum = FrameworkType(framework.lower())
+            target_framework_str = target_framework_enum.value
         except ValueError:
             console.print(f"[bold red]Error:[/bold red] Unknown framework '{framework}'.")
             raise SystemExit(1)
 
-    target_database = cfg.deployment.database
+    target_database_str = current_database_str
     if database is not None:
         try:
-            target_database = DatabasePreference(database.lower())
+            target_database_enum = DatabasePreference(database.lower())
+            target_database_str = target_database_enum.value
         except ValueError:
             console.print(f"[bold red]Error:[/bold red] Unknown database preference '{database}'.")
             raise SystemExit(1)
 
-    target_port = port if port is not None else cfg.deployment.docker.port
-    target_redis = redis if redis is not None else cfg.deployment.redis
-    target_worker = worker if worker is not None else cfg.deployment.celery
+    target_port = port if port is not None else current_port
+    target_redis = redis if redis is not None else current_redis
+    target_worker = worker if worker is not None else current_worker
 
-    # Check if anything changed
-    changed = (
-        target_git != cfg.git.repository
-        or target_branch != cfg.git.branch
-        or target_private != cfg.git.private
-        or target_domain != cfg.deployment.domain
-        or target_framework != cfg.deployment.framework
-        or target_database != cfg.deployment.database
-        or target_port != cfg.deployment.docker.port
-        or target_redis != cfg.deployment.redis
-        or target_worker != cfg.deployment.celery
-    )
-
-    if not changed:
-        console.print("[dim]No changes specified for project configuration.[/dim]")
-        return cfg
+    # Build and validate proposed new ProjectConfig
+    now_iso = datetime.now(timezone.utc).isoformat()
+    try:
+        proposed_cfg = ProjectConfig(
+            version=1,
+            project=ProjectMeta(
+                name=valid_name,
+                created_at=current_created_at or now_iso,
+                updated_at=now_iso,
+            ),
+            git=GitConfig(
+                repository=target_git,
+                branch=target_branch,
+                private=target_private,
+                verified=False,
+            ),
+            deployment=DeploymentConfig(
+                framework=FrameworkType(target_framework_str),
+                domain=target_domain,
+                database=DatabasePreference(target_database_str),
+                docker=DockerConfig(compose_file="docker-compose.deployx.yml", port=target_port),
+                healthcheck=HealthcheckConfig(enabled=True),
+                redis=target_redis,
+                celery=target_worker,
+            ),
+        )
+    except Exception as exc:
+        console.print(
+            f"[bold red]Configuration Validation Error:[/bold red]\n{format_validation_error(exc)}"
+        )
+        raise SystemExit(1)
 
     # Display Current vs New Summary Panel
     summary_text = (
         f"[bold]Current configuration:[/bold]\n"
-        f"  Repository: {cfg.git.repository}\n"
-        f"  Branch:     {cfg.git.branch}\n"
-        f"  Private:    {'Yes' if cfg.git.private else 'No'}\n"
-        f"  Domain:     {cfg.deployment.domain or 'None'}\n"
-        f"  Framework:  {cfg.deployment.framework.value}\n"
-        f"  Database:   {cfg.deployment.database.value}\n\n"
+        f"  Repository: {current_repo}\n"
+        f"  Branch:     {current_branch}\n"
+        f"  Private:    {'Yes' if current_private else 'No'}\n"
+        f"  Domain:     {current_domain or 'None'}\n"
+        f"  Framework:  {current_framework_str}\n"
+        f"  Database:   {current_database_str}\n\n"
         f"[bold]New configuration:[/bold]\n"
         f"  Repository: {target_git}\n"
         f"  Branch:     {target_branch}\n"
         f"  Private:    {'Yes' if target_private else 'No'}\n"
         f"  Domain:     {target_domain or 'None'}\n"
-        f"  Framework:  {target_framework.value}\n"
-        f"  Database:   {target_database.value}"
+        f"  Framework:  {target_framework_str}\n"
+        f"  Database:   {target_database_str}"
     )
     console.print(Panel(summary_text, title=f"Project Configuration Edit: {valid_name}", border_style="cyan"))
 
@@ -740,13 +969,16 @@ def edit_project(
             confirmed = False
         if not confirmed:
             console.print("[dim]Edit cancelled. No changes applied.[/dim]")
-            return cfg
+            if cfg is not None:
+                return cfg
+            raise SystemExit(0)
 
     # Verification invalidation and transition handling
     repo_changed = (
-        target_git != cfg.git.repository
-        or target_branch != cfg.git.branch
-        or target_private != cfg.git.private
+        target_git != current_repo
+        or target_branch != current_branch
+        or target_private != current_private
+        or cfg is None  # Recovered from invalid config
     )
 
     if repo_changed:
@@ -768,7 +1000,7 @@ def edit_project(
                 )
         else:
             # Transition to or remaining Public
-            if cfg.git.private and not target_private:
+            if current_private and not target_private:
                 key_path = paths.get_project_key_path(valid_name)
                 if key_path.exists():
                     console.print(
@@ -783,25 +1015,13 @@ def edit_project(
                 console.print(f"[bold red]Public repository verification failed:[/bold red] {exc}")
                 raise SystemExit(1)
     else:
-        target_verified = getattr(cfg.git, "verified", False)
+        target_verified = getattr(cfg.git, "verified", False) if cfg else False
 
-    # Apply changes to model
-    now_iso = datetime.now(timezone.utc).isoformat()
-    cfg.git.repository = target_git
-    cfg.git.branch = target_branch
-    cfg.git.private = target_private
-    cfg.git.verified = target_verified
-    cfg.deployment.domain = target_domain
-    cfg.deployment.framework = target_framework
-    cfg.deployment.database = target_database
-    cfg.deployment.docker.port = target_port
-    cfg.deployment.redis = target_redis
-    cfg.deployment.celery = target_worker
-    cfg.project.updated_at = now_iso
+    proposed_cfg.git.verified = target_verified
 
     # Atomic write to deployx.yml
     config_file = paths.get_project_config_path(valid_name)
-    atomic_write_file(config_file, cfg.to_yaml(), mode=0o640)
+    atomic_write_file(config_file, proposed_cfg.to_yaml(), mode=0o640)
 
     # Update state
     if state:
@@ -827,7 +1047,7 @@ def edit_project(
             f"    [bold green]deployx update {valid_name}[/bold green]"
         )
 
-    return cfg
+    return proposed_cfg
 
 
 def rename_project(
@@ -880,13 +1100,24 @@ def rename_project(
         return False
 
     cfg = None
+    raw = None
     try:
         cfg = load_project_config(valid_old)
     except Exception:
-        pass
+        try:
+            raw = load_project_raw(valid_old)
+        except Exception:
+            raw = None
 
-    repo_display = cfg.git.repository if cfg else (old_state.repository if old_state else "Unknown")
-    branch_display = cfg.git.branch if cfg else (old_state.branch if old_state else "main")
+    if cfg:
+        repo_display = cfg.git.repository
+        branch_display = cfg.git.branch
+    elif raw and isinstance(raw.get("git"), dict):
+        repo_display = raw["git"].get("repository", "Unknown")
+        branch_display = raw["git"].get("branch", "main")
+    else:
+        repo_display = old_state.repository if old_state else "Unknown"
+        branch_display = old_state.branch if old_state else "main"
 
     console.print(
         f"\n[bold]Rename project:[/bold]\n"
@@ -924,11 +1155,17 @@ def rename_project(
             actions_done.append("move_pdir")
 
         # 2. Update config file in new_pdir
+        new_cfg_file = paths.get_project_config_path(valid_new)
         if cfg:
-            new_cfg_file = paths.get_project_config_path(valid_new)
             cfg.project.name = valid_new
             cfg.project.updated_at = datetime.now(timezone.utc).isoformat()
             atomic_write_file(new_cfg_file, cfg.to_yaml(), mode=0o640)
+            actions_done.append("update_cfg")
+        elif raw:
+            if isinstance(raw.get("project"), dict):
+                raw["project"]["name"] = valid_new
+                raw["project"]["updated_at"] = datetime.now(timezone.utc).isoformat()
+            atomic_write_file(new_cfg_file, yaml.dump(raw, sort_keys=False), mode=0o640)
             actions_done.append("update_cfg")
 
         # 3. Rename state file

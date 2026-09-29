@@ -53,18 +53,20 @@ def create_deploy_key(
     from deployx.deployment.project import load_project_config, project_exists
     from deployx.core.security import validate_git_url, SecurityError
 
-    if project_exists(valid_name):
+    if project_exists(valid_name) or paths.get_project_dir(valid_name).exists():
         try:
             cfg = load_project_config(valid_name)
             validate_git_url(cfg.git.repository, check_placeholders=True)
-        except (SecurityError, ValueError) as exc:
+        except Exception as exc:
+            from deployx.core.security import format_validation_error
             msg = (
-                "Project repository configuration is invalid.\n"
-                "Fix the repository URL before creating a deploy key."
+                f"Project repository configuration is invalid. Configuration for '{valid_name}' contains errors:\n"
+                f"  {format_validation_error(exc)}\n\n"
+                f"Fix the repository URL with: deployx project edit {valid_name} --git <valid_url>"
             )
             if console:
-                console.print(f"[bold red]{msg}[/bold red]")
-            raise ValueError(msg) from exc
+                console.print(f"[bold red]Error:[/bold red] {msg}")
+            raise ValueError(msg) from None
 
     key_path = paths.get_project_key_path(valid_name)
     pub_path = paths.get_project_pubkey_path(valid_name)
@@ -169,7 +171,18 @@ def verify_deploy_key(project_name: str, console: Optional[Console] = None) -> b
     from deployx.core.filesystem import atomic_write_file
 
     valid_name = validate_project_name(project_name)
-    cfg = load_project_config(valid_name)
+    try:
+        cfg = load_project_config(valid_name)
+    except Exception as exc:
+        from deployx.core.security import format_validation_error
+        msg = (
+            f"Project configuration for '{valid_name}' is invalid:\n"
+            f"  {format_validation_error(exc)}\n\n"
+            f"Fix the configuration with: deployx project edit {valid_name} --git <valid_url>"
+        )
+        if console:
+            console.print(f"[bold red]Error:[/bold red] {msg}")
+        return False
     repo_url = cfg.git.repository
     branch = cfg.git.branch
 

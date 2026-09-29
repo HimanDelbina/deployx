@@ -5,15 +5,92 @@ Built with Typer and Rich for production-grade terminal ergonomics.
 
 from __future__ import annotations
 
+import functools
 import sys
 from typing import Optional
 import typer
 from rich.console import Console
+from pydantic import ValidationError
 
 from deployx import __version__
+from deployx.core.command import CommandError
+from deployx.core.security import SecurityError, format_validation_error
 
 console = Console()
 error_console = Console(stderr=True)
+
+
+def handle_cli_exceptions(func):
+    """
+    Decorator for Typer CLI commands to cleanly catch operational exceptions
+    (PermissionError, ValidationError, SecurityError, ValueError, CommandError)
+    and output human-readable rich messages without raw Python tracebacks.
+    """
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        try:
+            return func(*args, **kwargs)
+        except typer.Exit:
+            raise
+        except SystemExit as exc:
+            if exc.code == 0:
+                raise
+            raise typer.Exit(exc.code if isinstance(exc.code, int) else 1)
+        except PermissionError as exc:
+            target_path = getattr(exc, "filename", None) or str(exc)
+            if not target_path or target_path.startswith("[Errno"):
+                target_path = "/opt/deployx/projects"
+            # Format clean advice for elevated privileges
+            cmd_invoked = None
+            if len(sys.argv) > 1 and not any("pytest" in arg for arg in sys.argv):
+                cmd_invoked = " ".join(sys.argv[1:])
+            else:
+                fn_name = func.__name__
+                project_arg = kwargs.get("project") or kwargs.get("name") or (args[0] if args else "")
+                if fn_name == "project_list":
+                    cmd_invoked = "project list"
+                elif fn_name == "project_info":
+                    cmd_invoked = f"project info {project_arg}".strip()
+                elif fn_name == "project_edit":
+                    cmd_invoked = f"project edit {project_arg}".strip()
+                elif fn_name == "project_remove":
+                    cmd_invoked = f"project remove {project_arg}".strip()
+                elif fn_name == "project_rename":
+                    cmd_invoked = f"project rename {kwargs.get('old_name', '')} {kwargs.get('new_name', '')}".strip()
+                elif fn_name == "project_add":
+                    cmd_invoked = "project add"
+                elif fn_name.startswith("key_"):
+                    sub = fn_name.replace("key_", "")
+                    cmd_invoked = f"key {sub} {project_arg}".strip()
+                elif fn_name in ("deploy", "update", "status", "logs", "restart", "stop", "start", "doctor"):
+                    cmd_invoked = f"{fn_name} {project_arg}".strip()
+                else:
+                    cmd_invoked = "<command>"
+
+            console.print(
+                f"[bold red]Permission Denied:[/bold red] DeployX does not have permission to access: {target_path}\n"
+                f"Run this command with elevated privileges:\n"
+                f"  [bold cyan]sudo deployx {cmd_invoked}[/bold cyan]"
+            )
+            raise typer.Exit(1)
+        except ValidationError as exc:
+            console.print(
+                f"[bold red]Configuration Validation Error:[/bold red]\n{format_validation_error(exc)}"
+            )
+            raise typer.Exit(1)
+        except SecurityError as exc:
+            console.print(f"[bold red]Security Error:[/bold red] {exc}")
+            raise typer.Exit(1)
+        except ValueError as exc:
+            console.print(f"[bold red]Error:[/bold red] {exc}")
+            raise typer.Exit(1)
+        except CommandError as exc:
+            advice = f"\n[dim]{exc.actionable_advice}[/dim]" if getattr(exc, "actionable_advice", None) else ""
+            console.print(f"[bold red]Command Error:[/bold red] {exc.message}{advice}")
+            raise typer.Exit(1)
+
+    return wrapper
+
 
 app = typer.Typer(
     name="deployx",
@@ -56,6 +133,7 @@ def main(
 # Doctor
 # ----------------------------------------------------------------------
 @app.command("doctor")
+@handle_cli_exceptions
 def doctor():
     """
     Diagnose Ubuntu server environment, Docker, Git, Python, permissions, and directories.
@@ -68,6 +146,7 @@ def doctor():
 # Project Commands
 # ----------------------------------------------------------------------
 @project_app.command("add")
+@handle_cli_exceptions
 def project_add(
     name: Optional[str] = typer.Option(None, "--name", "-n", help="Project name"),
     git: Optional[str] = typer.Option(None, "--git", "-g", help="Git repository URL"),
@@ -96,6 +175,7 @@ def project_add(
 
 
 @project_app.command("remove")
+@handle_cli_exceptions
 def project_remove(
     project: str = typer.Argument(..., help="Project name to remove"),
     purge: bool = typer.Option(False, "--purge", help="Stop and remove Docker containers and networks"),
@@ -122,6 +202,7 @@ def project_remove(
 
 
 @project_app.command("edit")
+@handle_cli_exceptions
 def project_edit(
     project: str = typer.Argument(..., help="Project name to edit"),
     git: Optional[str] = typer.Option(None, "--git", "-g", help="New Git repository URL"),
@@ -162,6 +243,7 @@ def project_edit(
 
 
 @project_app.command("rename")
+@handle_cli_exceptions
 def project_rename(
     old_name: str = typer.Argument(..., help="Current project name"),
     new_name: str = typer.Argument(..., help="New project name"),
@@ -186,6 +268,7 @@ def project_rename(
 
 
 @project_app.command("list")
+@handle_cli_exceptions
 def project_list():
     """
     List all registered projects and their current status.
@@ -195,6 +278,7 @@ def project_list():
 
 
 @project_app.command("info")
+@handle_cli_exceptions
 def project_info(project: str = typer.Argument(..., help="Project name")):
     """
     Display configuration and deployment metadata for a project.
@@ -207,6 +291,7 @@ def project_info(project: str = typer.Argument(..., help="Project name")):
 # SSH Deploy Key Commands
 # ----------------------------------------------------------------------
 @key_app.command("create")
+@handle_cli_exceptions
 def key_create(
     project: str = typer.Argument(..., help="Project name"),
     force: bool = typer.Option(False, "--force", "-f", help="Overwrite existing key if present"),
@@ -215,28 +300,39 @@ def key_create(
     Generate an isolated ED25519 SSH deploy key for a private project.
     """
     from deployx.git.ssh import create_deploy_key
-    create_deploy_key(project, force=force, console=console)
+    try:
+        create_deploy_key(project, force=force, console=console)
+    except (ValueError, SecurityError):
+        raise typer.Exit(1)
 
 
 @key_app.command("show")
+@handle_cli_exceptions
 def key_show(project: str = typer.Argument(..., help="Project name")):
     """
     Display the public SSH deploy key to add to GitHub repository settings.
     """
     from deployx.git.ssh import show_deploy_key
-    show_deploy_key(project, console=console)
+    try:
+        show_deploy_key(project, console=console)
+    except FileNotFoundError:
+        raise typer.Exit(1)
 
 
 @key_app.command("verify")
+@handle_cli_exceptions
 def key_verify(project: str = typer.Argument(..., help="Project name")):
     """
     Verify SSH deploy key access to GitHub without performing a clone.
     """
     from deployx.git.ssh import verify_deploy_key
-    verify_deploy_key(project, console=console)
+    success = verify_deploy_key(project, console=console)
+    if not success:
+        raise typer.Exit(1)
 
 
 @key_app.command("remove")
+@handle_cli_exceptions
 def key_remove(
     project: str = typer.Argument(..., help="Project name"),
     force: bool = typer.Option(False, "--force", "-f", help="Skip confirmation prompt"),
@@ -251,29 +347,35 @@ def key_remove(
         raise typer.Exit(1)
 
 
-
 # ----------------------------------------------------------------------
 # Lifecycle & Deployment Commands
 # ----------------------------------------------------------------------
 @app.command("deploy")
+@handle_cli_exceptions
 def deploy(project: str = typer.Argument(..., help="Project name")):
     """
     Execute full deployment pipeline for a registered project.
     """
     from deployx.deployment.deploy import run_deployment
-    run_deployment(project, console=console)
+    success = run_deployment(project, console=console)
+    if not success:
+        raise typer.Exit(1)
 
 
 @app.command("update")
+@handle_cli_exceptions
 def update(project: str = typer.Argument(..., help="Project name")):
     """
     Check remote Git repository for new commits and perform an incremental update.
     """
     from deployx.deployment.update import run_update
-    run_update(project, console=console)
+    success = run_update(project, console=console)
+    if not success:
+        raise typer.Exit(1)
 
 
 @app.command("status")
+@handle_cli_exceptions
 def status(project: str = typer.Argument(..., help="Project name")):
     """
     Check container and healthcheck status for a project.
@@ -283,6 +385,7 @@ def status(project: str = typer.Argument(..., help="Project name")):
 
 
 @app.command("logs")
+@handle_cli_exceptions
 def logs(
     project: str = typer.Argument(..., help="Project name"),
     follow: bool = typer.Option(False, "--follow", "-f", help="Follow log output"),
@@ -296,6 +399,7 @@ def logs(
 
 
 @app.command("restart")
+@handle_cli_exceptions
 def restart(project: str = typer.Argument(..., help="Project name")):
     """
     Restart all Docker containers for a project.
@@ -305,6 +409,7 @@ def restart(project: str = typer.Argument(..., help="Project name")):
 
 
 @app.command("stop")
+@handle_cli_exceptions
 def stop(project: str = typer.Argument(..., help="Project name")):
     """
     Stop all running Docker containers for a project.
@@ -314,6 +419,7 @@ def stop(project: str = typer.Argument(..., help="Project name")):
 
 
 @app.command("start")
+@handle_cli_exceptions
 def start(project: str = typer.Argument(..., help="Project name")):
     """
     Start existing stopped Docker containers for a project.

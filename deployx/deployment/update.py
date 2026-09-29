@@ -27,7 +27,28 @@ def run_update(project_name: str, console: Optional[Console] = None) -> bool:
     """
     valid_name = validate_project_name(project_name)
     logger = ProjectLogger(valid_name)
-    config = load_project_config(valid_name)
+    try:
+        config = load_project_config(valid_name)
+    except Exception as exc:
+        from deployx.core.security import format_validation_error
+        msg = (
+            f"[bold red]Project configuration for '{valid_name}' is invalid:[/bold red]\n\n"
+            f"  {format_validation_error(exc)}\n\n"
+            f"[bold yellow]To repair this project:[/bold yellow]\n"
+            f"  [bold cyan]deployx project edit {valid_name} --git <valid_repository_url>[/bold cyan]\n\n"
+            f"[bold yellow]To inspect configuration:[/bold yellow]\n"
+            f"  [bold cyan]deployx project info {valid_name}[/bold cyan]"
+        )
+        if console:
+            console.print(
+                Panel(
+                    msg,
+                    title=f"Update Blocked: {valid_name}",
+                    border_style="red",
+                )
+            )
+        logger.error(f"Configuration validation failed for '{valid_name}': {exc}")
+        return False
     state_mgr = get_state_manager()
     state = state_mgr.get_state(valid_name)
 

@@ -5,6 +5,21 @@ All notable changes to DeployX are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.3] - 2026-09-29
+
+### Fixed
+- **Invalid Project Discovery**: Fixed `deployx project list` silently dropping invalid or legacy projects and printing "No projects registered yet." when directories existed. Invalid projects are now prominently displayed with `INVALID_CONFIG` status.
+- **Raw Pydantic Tracebacks on Config Inspection**: Replaced raw `ValidationError` crashes in `deployx project info` with a structured diagnostic panel reporting validation problems and recovery actions.
+- **Unprivileged Permission Error Stack Traces**: Caught `PermissionError` when running commands without sudo on `/opt/deployx`, displaying clean elevated privilege advice (`sudo deployx <command>`) and eliminating raw tracebacks.
+- **Broken Project Removal**: Enabled `deployx project remove` to cleanly unregister projects with malformed or invalid configurations while continuing to preserve Docker volumes, backups, and SSH deploy keys.
+- **Deployment & Key Guarding**: Preflight checks in `deploy`, `update`, `key create`, and `key verify` now cleanly intercept invalid configs with repair guidance and zero tracebacks.
+
+### Added
+- **Legacy Configuration Repair Flow**: Decoupled raw YAML loading (`load_project_raw`) from schema validation (`load_project_config`) in `deployx project edit`, allowing users to fix invalid fields on existing legacy configs without upfront validation failures.
+- **Unified CLI Exception Handling (`@handle_cli_exceptions`)**: Robust decorator across all Typer commands catching `PermissionError`, `ValidationError`, `SecurityError`, `CommandError`, and `ValueError` to ensure human-readable error output and consistent non-zero exit codes.
+
+---
+
 ## [0.1.2] - 2026-09-29
 
 ### Added

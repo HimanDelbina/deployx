@@ -298,3 +298,23 @@ def redact_sensitive_text(text: str, extra_secrets: list[str] | None = None) -> 
                 redacted = redacted.replace(secret_val, "[REDACTED]")
     
     return redacted
+
+
+def format_validation_error(exc: Exception) -> str:
+    """
+    Extracts a concise, human-readable error string from a validation exception,
+    avoiding raw Python traceback dumps.
+    """
+    from pydantic import ValidationError
+
+    if isinstance(exc, ValidationError):
+        lines: list[str] = []
+        for err in exc.errors():
+            loc = " -> ".join(str(item) for item in err.get("loc", []))
+            msg = err.get("msg", "Validation failed")
+            if msg.startswith("Value error, "):
+                msg = msg[len("Value error, "):]
+            lines.append(f"{loc}: {msg}" if loc else msg)
+        return "\n".join(lines)
+    return str(exc)
+

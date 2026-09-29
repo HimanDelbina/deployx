@@ -58,7 +58,28 @@ def run_deployment(
         # Stage 1: Preflight checks & load configuration
         if console:
             console.print("[1/12] [cyan]Running preflight checks...[/cyan]")
-        config: ProjectConfig = load_project_config(valid_name)
+        try:
+            config: ProjectConfig = load_project_config(valid_name)
+        except Exception as exc:
+            from deployx.core.security import format_validation_error
+            msg = (
+                f"[bold red]Project configuration for '{valid_name}' is invalid:[/bold red]\n\n"
+                f"  {format_validation_error(exc)}\n\n"
+                f"[bold yellow]To repair this project:[/bold yellow]\n"
+                f"  [bold cyan]deployx project edit {valid_name} --git <valid_repository_url>[/bold cyan]\n\n"
+                f"[bold yellow]To inspect configuration:[/bold yellow]\n"
+                f"  [bold cyan]deployx project info {valid_name}[/bold cyan]"
+            )
+            if console:
+                console.print(
+                    Panel(
+                        msg,
+                        title=f"Deployment Blocked: {valid_name}",
+                        border_style="red",
+                    )
+                )
+            logger.error(f"Configuration validation failed for '{valid_name}': {exc}")
+            return False
 
         # Check SSH key and verification state if private
         if config.git.private:
