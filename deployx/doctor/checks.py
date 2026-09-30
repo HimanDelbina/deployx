@@ -442,9 +442,114 @@ def check_dns_resolution() -> DoctorItem:
         )
 
 
-def collect_doctor_checks() -> List[DoctorItem]:
+def check_orphan_resources() -> DoctorItem:
+    """
+    Scans for Docker resources carrying DeployX management labels or naming conventions
+    whose associated project is no longer registered. (Requirement 14, 15)
+    """
+    from deployx.deployment.project import project_exists
+    from deployx.docker.compose import find_managed_containers, find_managed_volumes
+
+    orphan_projects: dict[str, dict[str, int]] = {}
+
+    try:
+        # Containers
+        for c in find_managed_containers():
+            lbl = c.get("labels", "")
+            pname = None
+            for p in lbl.split(","):
+                if p.strip().startswith("com.deployx.project="):
+                    pname = p.strip().split("=")[1].strip()
+                    break
+            if not pname and c.get("name", "").startswith("deployx_"):
+                parts = c["name"].split("_")
+                if len(parts) >= 2:
+                    pname = parts[1]
+            if pname and not project_exists(pname):
+                if pname not in orphan_projects:
+                    orphan_projects[pname] = {"containers": 0, "volumes": 0}
+                orphan_projects[pname]["containers"] += 1
+
+        # Volumes
+        for v in find_managed_volumes():
+            lbl = v.get("labels", "")
+            pname = None
+            for p in lbl.split(","):
+                if p.strip().startswith("com.deployx.project="):
+                    pname = p.strip().split("=")[1].strip()
+                    break
+            if not pname and v.get("name", "").startswith("deployx_"):
+                parts = v["name"].split("_")
+                if len(parts) >= 2:
+                    pname = parts[1]
+            if pname and not project_exists(pname):
+                if pname not in orphan_projects:
+                    orphan_projects[pname] = {"containers": 0, "volumes": 0}
+                orphan_projects[pname]["volumes"] += 1
+
+    except Exception:
+        pass
+
+    if orphan_projects:
+        details_list = [
+            f"{p} ({counts['containers']} containers, {counts['volumes']} volumes)"
+            for p, counts in orphan_projects.items()
+        ]
+        return DoctorItem(
+            category="Docker",
+            name="Orphan Resources",
+            status=CheckStatus.WARNING,
+            details=f"Unregistered project resources detected: {', '.join(details_list)}",
+            recommendation="Clean orphan resources using 'deployx project remove <project> --purge' or Docker CLI.",
+        )
+    return DoctorItem(
+        category="Docker",
+        name="Orphan Resources",
+        status=CheckStatus.OK,
+        details="No orphan DeployX containers or volumes detected",
+    )
+
+
+def check_docker_container_network() -> DoctorItem:
+    """
+    Tests DNS resolution and network reachability from inside a temporary Docker container.
+    """
+    from deployx.core.command import run_command
+    cmd = [
+        "docker", "run", "--rm",
+        "alpine:latest",
+        "sh", "-c", "ping -c 1 -W 2 8.8.8.8 >/dev/null 2>&1 && nslookup github.com >/dev/null 2>&1"
+    ]
+    try:
+        res = run_command(cmd, timeout=10, check=False)
+        if res.success:
+            return DoctorItem(
+                category="Docker",
+                name="Container Network",
+                status=CheckStatus.OK,
+                details="Docker containers have functional outbound DNS and internet connectivity",
+            )
+        else:
+            return DoctorItem(
+                category="Docker",
+                name="Container Network",
+                status=CheckStatus.WARNING,
+                details="In-container outbound DNS or internet access failed",
+                recommendation="Docker container network failed to resolve public DNS. Configure DNS in /etc/docker/daemon.json (e.g. {\"dns\": [\"8.8.8.8\"]}) and restart docker.",
+            )
+    except Exception as exc:
+        return DoctorItem(
+            category="Docker",
+            name="Container Network",
+            status=CheckStatus.WARNING,
+            details=f"Could not verify container network: {exc}",
+            recommendation="Ensure Docker daemon is running and can pull or run containers.",
+        )
+
+
+def collect_doctor_checks(check_network: bool = False, orphans: bool = False) -> List[DoctorItem]:
     """Runs all doctor checks and returns the list of results."""
-    return [
+    items = [
         check_ubuntu_version(),
         check_python_version(),
         check_git(),
@@ -458,9 +563,18 @@ def collect_doctor_checks() -> List[DoctorItem]:
         check_pypi_reachability(),
         check_dns_resolution(),
     ]
+    if orphans:
+        items.append(check_orphan_resources())
+    if check_network:
+        items.append(check_docker_container_network())
+    return items
 
 
-def run_doctor(console: Console) -> bool:
+def run_doctor(
+    console: Console,
+    check_network: bool = False,
+    orphans: bool = False,
+) -> bool:
     """
     Executes doctor diagnostic checks and prints a formatted Rich report.
     Returns True if no ERROR checks were encountered, False otherwise.
@@ -468,7 +582,7 @@ def run_doctor(console: Console) -> bool:
     console.print("\n[bold cyan]DeployX Doctor Diagnostic Suite[/bold cyan]")
     console.print("[dim]Scanning host environment and dependencies...[/dim]\n")
 
-    items = collect_doctor_checks()
+    items = collect_doctor_checks(check_network=check_network, orphans=orphans)
 
     table = Table(show_header=True, header_style="bold magenta", expand=True)
     table.add_column("Category", style="cyan", width=12)
@@ -517,4 +631,124 @@ def run_doctor(console: Console) -> bool:
     else:
         console.print("[green]0 errors[/green]")
 
+    return err_count == 0
+
+
+def run_project_doctor(
+    project_name: str,
+    check_network: bool = False,
+    console: Optional[Console] = None,
+) -> bool:
+    """
+    Runs project-specific diagnostics: config validation, git/key access, database and mirror config.
+    """
+    if console is None:
+        console = Console()
+
+    from deployx.core.security import validate_project_name
+    from deployx.deployment.project import inspect_project_config
+    from deployx.state import get_state_manager
+
+    try:
+        valid_name = validate_project_name(project_name)
+    except Exception as exc:
+        console.print(f"[bold red]Error:[/bold red] {exc}")
+        return False
+
+    console.print(f"\n[bold cyan]DeployX Project Doctor: {valid_name}[/bold cyan]")
+    console.print("[dim]Checking project configuration, credentials, and infrastructure...[/dim]\n")
+
+    items: List[DoctorItem] = []
+
+    # 1. Config Check
+    inspection = inspect_project_config(valid_name)
+    if not inspection.valid:
+        items.append(
+            DoctorItem(
+                category="Project",
+                name="Configuration",
+                status=CheckStatus.ERROR,
+                details="deployx.yml contains validation errors",
+                recommendation=f"Run 'deployx project edit {valid_name}' to fix errors:\n{inspection.error_message}",
+            )
+        )
+    else:
+        cfg = inspection.config
+        items.append(
+            DoctorItem(
+                category="Project",
+                name="Configuration",
+                status=CheckStatus.OK,
+                details=f"Valid deployx.yml (framework: {cfg.deployment.framework.value}, database: {cfg.deployment.database.value})",
+            )
+        )
+
+        # 2. Git & Key Check
+        if cfg.git.private:
+            key_path = paths.get_project_key_path(valid_name)
+            if not key_path.exists():
+                items.append(
+                    DoctorItem(
+                        category="Git",
+                        name="Deploy Key",
+                        status=CheckStatus.ERROR,
+                        details="Private repository configured but SSH deploy key is missing",
+                        recommendation=f"Run 'deployx key create {valid_name}' and add to GitHub Deploy Keys.",
+                    )
+                )
+            else:
+                items.append(
+                    DoctorItem(
+                        category="Git",
+                        name="Deploy Key",
+                        status=CheckStatus.OK,
+                        details=f"Deploy key present at {key_path}",
+                    )
+                )
+        else:
+            items.append(
+                DoctorItem(
+                    category="Git",
+                    name="Repository Access",
+                    status=CheckStatus.OK,
+                    details=f"Public repository ({cfg.git.repository})",
+                )
+            )
+
+        # 3. State Check
+        state = get_state_manager().get_state(valid_name)
+        if state:
+            st = CheckStatus.OK if state.status.value in ("healthy", "pending") else CheckStatus.WARNING
+            items.append(
+                DoctorItem(
+                    category="Deployment",
+                    name="Current State",
+                    status=st,
+                    details=f"Status: {state.status.value}, Commit: {state.current_commit[:7] if state.current_commit else 'None'}",
+                )
+            )
+
+    # 4. Optional network test
+    if check_network:
+        items.append(check_docker_container_network())
+
+    # Render table
+    table = Table(show_header=True, header_style="bold magenta", expand=True)
+    table.add_column("Category", style="cyan", width=14)
+    table.add_column("Check", style="bold", width=24)
+    table.add_column("Status", width=12)
+    table.add_column("Details", style="white")
+
+    err_count = 0
+    for item in items:
+        if item.status == CheckStatus.OK:
+            s_text = "[bold green][ OK ][/bold green]"
+        elif item.status == CheckStatus.WARNING:
+            s_text = "[bold yellow][ WARN ][/bold yellow]"
+        else:
+            s_text = "[bold red][ ERROR ][/bold red]"
+            err_count += 1
+        table.add_row(item.category, item.name, s_text, item.details)
+
+    console.print(table)
     return err_count == 0

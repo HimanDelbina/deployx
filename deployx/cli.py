@@ -134,12 +134,17 @@ def main(
 # ----------------------------------------------------------------------
 @app.command("doctor")
 @handle_cli_exceptions
-def doctor():
+def doctor(
+    docker_network: bool = typer.Option(False, "--docker-network", help="Test in-container outbound DNS and network reachability"),
+    orphans: bool = typer.Option(False, "--orphans", help="Scan for orphan Docker containers, volumes, and images"),
+):
     """
     Diagnose Ubuntu server environment, Docker, Git, Python, permissions, and directories.
     """
     from deployx.doctor.checks import run_doctor
-    run_doctor(console)
+    success = run_doctor(console, check_network=docker_network, orphans=orphans)
+    if not success:
+        raise typer.Exit(1)
 
 
 # ----------------------------------------------------------------------
@@ -178,8 +183,12 @@ def project_add(
 @handle_cli_exceptions
 def project_remove(
     project: str = typer.Argument(..., help="Project name to remove"),
-    purge: bool = typer.Option(False, "--purge", help="Stop and remove Docker containers and networks"),
+    purge: bool = typer.Option(False, "--purge", help="Stop and remove Docker containers, images, and networks"),
     delete_volumes: bool = typer.Option(False, "--delete-volumes", help="Permanently delete project Docker volumes (requires --purge)"),
+    remove_containers: bool = typer.Option(False, "--remove-containers", help="Remove project Docker containers"),
+    remove_images: bool = typer.Option(False, "--remove-images", help="Remove project Docker images"),
+    remove_volumes: bool = typer.Option(False, "--remove-volumes", help="Permanently delete project Docker volumes"),
+    remove_key: bool = typer.Option(False, "--remove-key", help="Remove SSH deploy key"),
     force: bool = typer.Option(False, "--force", "-f", help="Skip confirmation prompt"),
     yes: bool = typer.Option(False, "--yes", "-y", help="Confirm destructive volume deletion in non-interactive mode"),
     non_interactive: bool = typer.Option(False, "--non-interactive", help="Run without interactive confirmation prompts"),
@@ -191,7 +200,11 @@ def project_remove(
     success = remove_project(
         project_name=project,
         purge=purge,
-        delete_volumes=delete_volumes,
+        delete_volumes=(delete_volumes or remove_volumes),
+        remove_containers=remove_containers,
+        remove_images=remove_images,
+        remove_volumes=(remove_volumes or delete_volumes),
+        remove_key=remove_key,
         force=force,
         yes=yes,
         non_interactive=non_interactive,
@@ -220,6 +233,9 @@ def project_edit(
     pip_extra_index_url: Optional[str] = typer.Option(None, "--pip-extra-index-url", help="Extra Python package index URL"),
     pip_trusted_host: Optional[str] = typer.Option(None, "--pip-trusted-host", help="Trusted host for Python package index"),
     clear_pip_index: bool = typer.Option(False, "--clear-pip-index", help="Reset Python package index to default PyPI"),
+    clear_pip_extra_index: bool = typer.Option(False, "--clear-pip-extra-index", help="Reset extra package index URL"),
+    clear_pip_trusted_host: bool = typer.Option(False, "--clear-pip-trusted-host", help="Reset trusted host for package index"),
+    clear_all_pip_settings: bool = typer.Option(False, "--clear-all-pip-settings", help="Reset all Python package mirror settings"),
     non_interactive: bool = typer.Option(False, "--non-interactive", help="Disable interactive prompts"),
     yes: bool = typer.Option(False, "--yes", "-y", help="Apply changes without confirmation"),
 ):
@@ -244,6 +260,9 @@ def project_edit(
         pip_extra_index_url=pip_extra_index_url,
         pip_trusted_host=pip_trusted_host,
         clear_pip_index=clear_pip_index,
+        clear_pip_extra_index=clear_pip_extra_index,
+        clear_pip_trusted_host=clear_pip_trusted_host,
+        clear_all_pip_settings=clear_all_pip_settings,
         non_interactive=non_interactive,
         yes=yes,
         console=console,
@@ -293,6 +312,21 @@ def project_info(project: str = typer.Argument(..., help="Project name")):
     """
     from deployx.deployment.project import show_project_info
     show_project_info(project, console)
+
+
+@project_app.command("doctor")
+@handle_cli_exceptions
+def project_doctor(
+    project: str = typer.Argument(..., help="Project name to diagnose"),
+    network: bool = typer.Option(False, "--network", help="Test container network reachability"),
+):
+    """
+    Run diagnostic checks on a specific project.
+    """
+    from deployx.doctor.checks import run_project_doctor
+    success = run_project_doctor(project, check_network=network, console=console)
+    if not success:
+        raise typer.Exit(1)
 
 
 # ----------------------------------------------------------------------
@@ -362,6 +396,8 @@ def key_remove(
 @handle_cli_exceptions
 def deploy(
     project: str = typer.Argument(..., help="Project name"),
+    build_timeout: Optional[int] = typer.Option(None, "--build-timeout", help="Docker build timeout in seconds"),
+    no_build_timeout: bool = typer.Option(False, "--no-build-timeout", help="Disable Docker build timeout (unlimited duration)"),
     verbose: bool = typer.Option(False, "--verbose", "-V", help="Show detailed command and build output"),
     plain: bool = typer.Option(False, "--plain", help="Plain text output without live redraws (recommended for CI)"),
     no_progress: bool = typer.Option(False, "--no-progress", help="Disable live progress bar"),
@@ -371,13 +407,17 @@ def deploy(
     Execute full deployment pipeline for a registered project.
     """
     from deployx.deployment.deploy import run_deployment
-    success = run_deployment(
-        project,
-        verbose=verbose,
-        plain=(plain or no_progress),
-        regenerate=regenerate,
-        console=console,
-    )
+    deploy_kwargs = {
+        "verbose": verbose,
+        "plain": (plain or no_progress),
+        "regenerate": regenerate,
+        "console": console,
+    }
+    if build_timeout is not None:
+        deploy_kwargs["build_timeout"] = build_timeout
+    if no_build_timeout:
+        deploy_kwargs["no_build_timeout"] = True
+    success = run_deployment(project, **deploy_kwargs)
     if not success:
         raise typer.Exit(1)
 
@@ -386,6 +426,8 @@ def deploy(
 @handle_cli_exceptions
 def update(
     project: str = typer.Argument(..., help="Project name"),
+    build_timeout: Optional[int] = typer.Option(None, "--build-timeout", help="Docker build timeout in seconds"),
+    no_build_timeout: bool = typer.Option(False, "--no-build-timeout", help="Disable Docker build timeout (unlimited duration)"),
     verbose: bool = typer.Option(False, "--verbose", "-V", help="Show detailed command and build output"),
     plain: bool = typer.Option(False, "--plain", help="Plain text output without live redraws (recommended for CI)"),
     no_progress: bool = typer.Option(False, "--no-progress", help="Disable live progress bar"),
@@ -395,11 +437,40 @@ def update(
     Check remote Git repository for new commits and perform an incremental update.
     """
     from deployx.deployment.update import run_update
-    success = run_update(
+    update_kwargs = {
+        "verbose": verbose,
+        "plain": (plain or no_progress),
+        "regenerate": regenerate,
+        "console": console,
+    }
+    if build_timeout is not None:
+        update_kwargs["build_timeout"] = build_timeout
+    if no_build_timeout:
+        update_kwargs["no_build_timeout"] = True
+    success = run_update(project, **update_kwargs)
+    if not success:
+        raise typer.Exit(1)
+
+
+@app.command("rollback")
+@handle_cli_exceptions
+def rollback(
+    project: str = typer.Argument(..., help="Project name to roll back"),
+    build_timeout: Optional[int] = typer.Option(None, "--build-timeout", help="Docker build timeout in seconds"),
+    no_build_timeout: bool = typer.Option(False, "--no-build-timeout", help="Disable Docker build timeout (unlimited duration)"),
+    verbose: bool = typer.Option(False, "--verbose", "-V", help="Show detailed command and build output"),
+    plain: bool = typer.Option(False, "--plain", help="Plain text output without live redraws"),
+):
+    """
+    Roll back a project to its previously deployed commit.
+    """
+    from deployx.deployment.rollback import rollback_project
+    success = rollback_project(
         project,
+        build_timeout=build_timeout,
+        no_build_timeout=no_build_timeout,
         verbose=verbose,
-        plain=(plain or no_progress),
-        regenerate=regenerate,
+        plain=plain,
         console=console,
     )
     if not success:

@@ -13,7 +13,7 @@ from typing import Any, Callable, List, Optional
 from rich.console import Console
 
 from deployx.config import paths
-from deployx.core.command import CommandError, CommandResult, run_command
+from deployx.core.command import CommandError, CommandResult, run_command, run_command_streaming
 from deployx.core.security import validate_project_name
 
 
@@ -37,16 +37,14 @@ class DockerComposeManager:
         on_heartbeat: Optional[Any] = None,
         on_stall: Optional[Any] = None,
         log_file: Optional[Path | str] = None,
-        timeout: int = 1200,
+        timeout: Optional[int] = 3600,
         env: Optional[dict[str, str]] = None,
     ) -> CommandResult:
         """
-        Runs 'docker compose build' with BuildKit plain progress output.
+        Runs 'docker compose --progress=plain -f file.yml build' with BuildKit output.
         When stream=True, streams output incrementally to prevent silent freezes.
         """
-        from deployx.core.command import run_command_streaming
-
-        cmd = self._base_cmd() + ["build", "--progress=plain"]
+        cmd = ["docker", "compose", "--progress=plain", "-f", str(self.compose_file), "build"]
         if no_cache:
             cmd.append("--no-cache")
         if service:
@@ -115,12 +113,26 @@ class DockerComposeManager:
         service: str,
         command: List[str],
         timeout: int = 300,
+        stream: bool = False,
+        on_line: Optional[Any] = None,
+        log_file: Optional[Path | str] = None,
     ) -> CommandResult:
         """
         Runs a one-off command in a service container without starting the service daemon.
         Uses 'docker compose run --rm -T <service> <command>'.
+        Supports real-time output streaming when stream=True.
         """
+        from deployx.core.command import run_command_streaming
+
         cmd = self._base_cmd() + ["run", "--rm", "-T", service] + command
+        if stream:
+            return run_command_streaming(
+                cmd,
+                cwd=self.project_dir,
+                timeout=timeout,
+                on_line=on_line,
+                log_file=log_file,
+            )
         return run_command(cmd, cwd=self.project_dir, timeout=timeout)
 
     def ps(self) -> CommandResult:
@@ -194,3 +206,292 @@ def show_project_logs(
         if console:
             console.print(f"[bold red]Failed to fetch logs:[/bold red] {exc}")
         raise SystemExit(1)
+
+
+def check_image_exists(image_tag: str) -> bool:
+    """Checks whether a Docker image exists locally."""
+    try:
+        res = run_command(["docker", "image", "inspect", image_tag], timeout=15, check=False)
+        return res.returncode == 0
+    except Exception:
+        return False
+
+
+def find_managed_containers(project_name: Optional[str] = None) -> List[dict[str, str]]:
+    """
+    Finds Docker containers managed by DeployX via labels or naming conventions.
+    """
+    results: List[dict[str, str]] = []
+    seen_ids = set()
+
+    # Query 1: by label
+    try:
+        res = run_command(
+            ["docker", "ps", "-a", "--filter", "label=com.deployx.managed=true", "--format", "{{.ID}}\t{{.Names}}\t{{.Status}}\t{{.Image}}\t{{.Labels}}"],
+            timeout=20,
+            check=False,
+        )
+        if res.success and res.stdout.strip():
+            for line in res.stdout.splitlines():
+                parts = line.split("\t")
+                if len(parts) >= 4:
+                    cid, name, status, img = parts[0], parts[1], parts[2], parts[3]
+                    labels = parts[4] if len(parts) > 4 else ""
+                    if cid not in seen_ids:
+                        seen_ids.add(cid)
+                        results.append({"id": cid, "name": name, "status": status, "image": img, "labels": labels})
+    except Exception:
+        pass
+
+    # Query 2: by name pattern if project_name specified
+    if project_name:
+        try:
+            prefix = f"deployx_{project_name}_"
+            res = run_command(
+                ["docker", "ps", "-a", "--filter", f"name={prefix}", "--format", "{{.ID}}\t{{.Names}}\t{{.Status}}\t{{.Image}}\t{{.Labels}}"],
+                timeout=20,
+                check=False,
+            )
+            if res.success and res.stdout.strip():
+                for line in res.stdout.splitlines():
+                    parts = line.split("\t")
+                    if len(parts) >= 4:
+                        cid, name, status, img = parts[0], parts[1], parts[2], parts[3]
+                        labels = parts[4] if len(parts) > 4 else ""
+                        if cid not in seen_ids:
+                            seen_ids.add(cid)
+                            results.append({"id": cid, "name": name, "status": status, "image": img, "labels": labels})
+        except Exception:
+            pass
+
+    if project_name:
+        filtered = []
+        for c in results:
+            lbl = c.get("labels", "")
+            if f"com.deployx.project={project_name}" in lbl or c["name"].startswith(f"deployx_{project_name}_") or c["name"] == f"deployx_{project_name}":
+                filtered.append(c)
+        return filtered
+
+    return results
+
+
+def find_managed_volumes(project_name: Optional[str] = None) -> List[dict[str, str]]:
+    """
+    Finds Docker volumes managed by DeployX via labels or naming conventions.
+    """
+    results: List[dict[str, str]] = []
+    seen_names = set()
+
+    try:
+        res = run_command(
+            ["docker", "volume", "ls", "--filter", "label=com.deployx.managed=true", "--format", "{{.Name}}\t{{.Labels}}"],
+            timeout=20,
+            check=False,
+        )
+        if res.success and res.stdout.strip():
+            for line in res.stdout.splitlines():
+                parts = line.split("\t")
+                if parts and parts[0]:
+                    vname = parts[0]
+                    vlabels = parts[1] if len(parts) > 1 else ""
+                    if vname not in seen_names:
+                        seen_names.add(vname)
+                        results.append({"name": vname, "labels": vlabels})
+    except Exception:
+        pass
+
+    if project_name:
+        try:
+            prefix = f"deployx_{project_name}_"
+            res = run_command(
+                ["docker", "volume", "ls", "--filter", f"name={prefix}", "--format", "{{.Name}}\t{{.Labels}}"],
+                timeout=20,
+                check=False,
+            )
+            if res.success and res.stdout.strip():
+                for line in res.stdout.splitlines():
+                    parts = line.split("\t")
+                    if parts and parts[0]:
+                        vname = parts[0]
+                        vlabels = parts[1] if len(parts) > 1 else ""
+                        if vname not in seen_names:
+                            seen_names.add(vname)
+                            results.append({"name": vname, "labels": vlabels})
+        except Exception:
+            pass
+
+    if project_name:
+        filtered = []
+        for v in results:
+            lbl = v.get("labels", "")
+            if f"com.deployx.project={project_name}" in lbl or v["name"].startswith(f"deployx_{project_name}_"):
+                filtered.append(v)
+        return filtered
+
+    return results
+
+
+def find_managed_images(project_name: Optional[str] = None) -> List[dict[str, str]]:
+    """
+    Finds Docker images managed by DeployX via labels or naming conventions.
+    """
+    results: List[dict[str, str]] = []
+    seen_ids = set()
+
+    try:
+        res = run_command(
+            ["docker", "images", "--filter", "label=com.deployx.managed=true", "--format", "{{.Repository}}:{{.Tag}}\t{{.ID}}\t{{.Labels}}"],
+            timeout=20,
+            check=False,
+        )
+        if res.success and res.stdout.strip():
+            for line in res.stdout.splitlines():
+                parts = line.split("\t")
+                if len(parts) >= 2:
+                    ref, iid = parts[0], parts[1]
+                    labels = parts[2] if len(parts) > 2 else ""
+                    if iid not in seen_ids:
+                        seen_ids.add(iid)
+                        results.append({"ref": ref, "id": iid, "labels": labels})
+    except Exception:
+        pass
+
+    if project_name:
+        try:
+            res = run_command(
+                ["docker", "images", f"deployx_{project_name}*", "--format", "{{.Repository}}:{{.Tag}}\t{{.ID}}\t{{.Labels}}"],
+                timeout=20,
+                check=False,
+            )
+            if res.success and res.stdout.strip():
+                for line in res.stdout.splitlines():
+                    parts = line.split("\t")
+                    if len(parts) >= 2:
+                        ref, iid = parts[0], parts[1]
+                        labels = parts[2] if len(parts) > 2 else ""
+                        if iid not in seen_ids:
+                            seen_ids.add(iid)
+                            results.append({"ref": ref, "id": iid, "labels": labels})
+        except Exception:
+            pass
+
+    if project_name:
+        filtered = []
+        for img in results:
+            lbl = img.get("labels", "")
+            if f"com.deployx.project={project_name}" in lbl or img["ref"].startswith(f"deployx_{project_name}:") or img["ref"].startswith(f"deployx_{project_name}_"):
+                filtered.append(img)
+        return filtered
+
+    return results
+
+
+def find_managed_networks(project_name: Optional[str] = None) -> List[dict[str, str]]:
+    """
+    Finds Docker networks managed by DeployX via labels or naming conventions.
+    """
+    results: List[dict[str, str]] = []
+    seen_names = set()
+
+    try:
+        res = run_command(
+            ["docker", "network", "ls", "--filter", "label=com.deployx.managed=true", "--format", "{{.Name}}\t{{.ID}}\t{{.Labels}}"],
+            timeout=20,
+            check=False,
+        )
+        if res.success and res.stdout.strip():
+            for line in res.stdout.splitlines():
+                parts = line.split("\t")
+                if parts and parts[0]:
+                    nname = parts[0]
+                    nid = parts[1] if len(parts) > 1 else ""
+                    nlabels = parts[2] if len(parts) > 2 else ""
+                    if nname not in seen_names:
+                        seen_names.add(nname)
+                        results.append({"name": nname, "id": nid, "labels": nlabels})
+    except Exception:
+        pass
+
+    if project_name:
+        try:
+            prefix = f"deployx_{project_name}_"
+            res = run_command(
+                ["docker", "network", "ls", "--filter", f"name={prefix}", "--format", "{{.Name}}\t{{.ID}}\t{{.Labels}}"],
+                timeout=20,
+                check=False,
+            )
+            if res.success and res.stdout.strip():
+                for line in res.stdout.splitlines():
+                    parts = line.split("\t")
+                    if parts and parts[0]:
+                        nname = parts[0]
+                        nid = parts[1] if len(parts) > 1 else ""
+                        nlabels = parts[2] if len(parts) > 2 else ""
+                        if nname not in seen_names:
+                            seen_names.add(nname)
+                            results.append({"name": nname, "id": nid, "labels": nlabels})
+        except Exception:
+            pass
+
+    if project_name:
+        filtered = []
+        for n in results:
+            lbl = n.get("labels", "")
+            if f"com.deployx.project={project_name}" in lbl or n["name"].startswith(f"deployx_{project_name}_"):
+                filtered.append(n)
+        return filtered
+
+    return results
+
+
+def purge_project_resources(
+    project_name: str,
+    remove_containers: bool = True,
+    remove_images: bool = True,
+    remove_volumes: bool = False,
+    remove_networks: bool = True,
+) -> dict[str, int]:
+    """
+    Safely purges Docker resources for a project using labels and naming conventions.
+    Does NOT depend on docker-compose.deployx.yml existing.
+    """
+    counts = {"containers": 0, "images": 0, "volumes": 0, "networks": 0}
+
+    # 1. Containers
+    if remove_containers:
+        for c in find_managed_containers(project_name):
+            try:
+                run_command(["docker", "rm", "-f", c["id"]], timeout=30, check=False)
+                counts["containers"] += 1
+            except Exception:
+                pass
+
+    # 2. Networks
+    if remove_networks:
+        for n in find_managed_networks(project_name):
+            try:
+                run_command(["docker", "network", "rm", n["name"]], timeout=15, check=False)
+                counts["networks"] += 1
+            except Exception:
+                pass
+
+    # 3. Volumes
+    if remove_volumes:
+        for v in find_managed_volumes(project_name):
+            try:
+                run_command(["docker", "volume", "rm", "-f", v["name"]], timeout=20, check=False)
+                counts["volumes"] += 1
+            except Exception:
+                pass
+
+    # 4. Images
+    if remove_images:
+        for img in find_managed_images(project_name):
+            try:
+                target = img["ref"] if (img["ref"] and img["ref"] != "<none>:<none>") else img["id"]
+                run_command(["docker", "rmi", "-f", target], timeout=30, check=False)
+                counts["images"] += 1
+            except Exception:
+                pass
+
+    return counts

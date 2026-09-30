@@ -1,4 +1,4 @@
-# DeployX (v0.1.5)
+# DeployX (v0.1.6)
 
 > **Production-Grade Autonomous Deployment Manager for Ubuntu Linux servers (22.04 / 24.04 LTS).**  
 > Effortlessly register, verify, deploy, and incrementally update public and private GitHub projects using Docker and Docker Compose v2 with zero host bloat.
@@ -242,24 +242,29 @@ Supported edit flags:
 - `--clear-pip-index`: Reset Python build mirror back to official PyPI defaults.
 
 ### Safe Project Removal
-DeployX provides three distinct tiers of project removal, prioritizing data safety:
+DeployX provides granular project removal flags, prioritizing data safety with preview plans and status tables:
 
 ```bash
-# Tier A: Default Safe Unregister
+# Default Safe Unregister
 # Removes project configuration and state from DeployX.
 # Containers, Docker volumes, backups, and SSH deploy keys are completely preserved!
 deployx project remove my-django-app
 
-# Tier B: Runtime Purge
-# Stops and removes project containers and networks.
-# Docker volumes, database data, backups, and SSH keys are NOT deleted!
+# Granular Runtime Cleanup:
+# Stop and remove containers and images:
+deployx project remove my-django-app --remove-containers --remove-images
+
+# Full Runtime Purge (containers + images):
 deployx project remove my-django-app --purge
 
-# Tier C: Destructive Volume Deletion
+# Remove project deploy key as well:
+deployx project remove my-django-app --remove-key
+
+# Destructive Volume Deletion
 # Stops containers AND permanently deletes project Docker volumes and database data.
 # In interactive mode, prompts to type project name for confirmation.
 # Backups and SSH deploy keys are STILL preserved!
-deployx project remove my-django-app --purge --delete-volumes
+deployx project remove my-django-app --purge --remove-volumes
 
 # Scripting / Non-Interactive Removal:
 # Safe unregister without interactive prompts:
@@ -267,7 +272,7 @@ deployx project remove my-django-app --force
 # Purge runtime containers without prompts:
 deployx project remove my-django-app --purge --force
 # Destructive volume deletion in non-interactive mode (requires explicit --yes):
-deployx project remove my-django-app --purge --delete-volumes --non-interactive --yes
+deployx project remove my-django-app --purge --remove-volumes --non-interactive --yes
 ```
 
 ### Pre-Deployment Project Renaming
@@ -332,15 +337,17 @@ deployx update my-django-app
 | `deployx key show <project>` | Displays public SSH deploy key |
 | `deployx key verify <project>` | Tests SSH authentication against remote repository & verifies branch |
 | `deployx key remove <project>` | Explicitly removes SSH deploy key pair with confirmation |
-| `deployx deploy <project>` | Builds, provisions, and deploys the project (supports `--regenerate`) |
-| `deployx update <project>` | Performs zero-drift, SHA-checked incremental update (supports `--regenerate`) |
+| `deployx deploy <project>` | Builds, provisions, and deploys the project (supports `--build-timeout`, `--regenerate`) |
+| `deployx update <project>` | Performs zero-drift, SHA-checked incremental update (supports `--build-timeout`) |
+| `deployx rollback <project>` | Safely rolls back project to previously deployed commit and Docker image |
 | `deployx generate <project>` | Safely regenerates DeployX-owned files (`Dockerfile.deployx`, compose manifest) |
 | `deployx status <project>` | Inspects live container statuses and healthcheck state |
 | `deployx logs <project>` | Views streaming or tailed Docker container logs (`--tail 100`, `--follow`) |
 | `deployx restart <project>` | Restarts project containers safely |
 | `deployx stop <project>` | Stops running containers |
 | `deployx start <project>` | Starts stopped containers |
-| `deployx doctor` | Runs full system, Docker, permission, and network diagnostics |
+| `deployx doctor` | Runs full system, Docker, permission, and network diagnostics (`--orphans`, `--docker-network`) |
+| `deployx project doctor <project>` | Runs targeted container, volume, network, and database checks for a project |
 
 ---
 

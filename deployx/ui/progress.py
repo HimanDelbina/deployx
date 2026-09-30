@@ -54,6 +54,7 @@ class BuildKitParser:
         self.current_operation: Optional[str] = None
         self.last_relevant_lines: List[str] = []
         self.max_history: int = 20
+        self.last_event_time: float = time.time()
 
     def _process_text(self, text: str) -> None:
         """Extracts build step counter and current operation from a line of text."""
@@ -267,7 +268,18 @@ class DeploymentProgressReporter:
         self.live_context = None
         self._last_heartbeat_time: float = self.deployment_start_time
         self.stall_reported: bool = False
+        self._last_stall_panel_time: float = 0.0
+        self.stall_threshold: float = 120.0
         self._last_reported_step_op: Optional[tuple[Optional[int], Optional[str]]] = None
+
+    def get_build_status(self) -> str:
+        """Returns the current build responsiveness state: ACTIVE, SLOW, or STALLED."""
+        idle = time.time() - getattr(self, "last_activity_time", time.time())
+        if idle < 45.0:
+            return "ACTIVE"
+        if idle < self.stall_threshold:
+            return "SLOW"
+        return "STALLED"
 
     @property
     def overall_percentage(self) -> int:
@@ -343,9 +355,12 @@ class DeploymentProgressReporter:
         """Emitted when a subprocess is silent for 20-30 seconds."""
         elapsed_str = format_duration(elapsed)
         idle_sec = int(idle)
+        status = "SLOW" if idle_sec >= 45 else "ACTIVE"
+        step_info = f"Step {self.parser.step_current}/{self.parser.step_total} " if (self.parser.step_current and self.parser.step_total) else ""
+        op = self.parser.current_operation or self.current_stage_name
         self.console.print(
-            f"[dim yellow]Still working... Current stage: {self.current_stage_name} | "
-            f"Elapsed: {elapsed_str} | Last output: {idle_sec}s ago[/dim yellow]"
+            f"[dim yellow]Build status: {status} | Current step: {step_info}{op[:50]} | "
+            f"Last progress event: {idle_sec}s ago | Elapsed: {elapsed_str}[/dim yellow]"
         )
 
     def on_stall(self, elapsed: float, idle: float) -> None:
@@ -353,9 +368,16 @@ class DeploymentProgressReporter:
         import os
         from deployx.core.security import redact_url_credentials
 
+        now = time.time()
+        # Warn once at threshold, repeat at most every 5 minutes (300s)
+        if getattr(self, "_last_stall_panel_time", 0.0) > 0 and (now - self._last_stall_panel_time) < 300.0:
+            return
+
+        self.stall_reported = True
+        self._last_stall_panel_time = now
+
         idle_min = int(idle // 60)
         idle_sec = int(idle)
-        self.stall_reported = True
 
         # Resolve configured Python index
         index_label = "Default (PyPI)"
@@ -374,8 +396,11 @@ class DeploymentProgressReporter:
         stall_msg = (
             f"[bold yellow]WARNING: No new Docker build output for {idle_min} minutes.[/bold yellow]\n"
             f"No new output for {idle_sec} seconds.\n\n"
+            f"[bold yellow]Build status: STALLED[/bold yellow]\n"
             f"[bold]Current build step:[/bold]\n"
             f"{current_step}\n\n"
+            f"[bold]Current step:[/bold] {current_step}\n"
+            f"[bold]Last progress event:[/bold] {idle_sec}s ago (threshold: {idle_min}m)\n\n"
             f"Possible network/package index issue.\n"
             f"Network or package index connectivity may be slow or temporarily constrained.\n\n"
             f"[bold]Configured Python index:[/bold]\n"

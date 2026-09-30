@@ -312,6 +312,7 @@ def run_command_streaming(
 
     last_output_time = time.time()
     last_heartbeat_time = last_output_time
+    last_stall_warning_time = 0.0
     stall_signaled = False
 
     log_fp = None
@@ -349,11 +350,13 @@ def run_command_streaming(
                         actionable_advice=f"The operation took longer than {timeout}s.",
                     )
 
-                # Stall detection check
-                if stall_timeout and idle >= stall_timeout and not stall_signaled:
-                    if on_stall:
-                        on_stall(elapsed, idle)
-                    stall_signaled = True
+                # Stall detection check (warn once, repeat only at ~5 min intervals)
+                if stall_timeout and idle >= stall_timeout:
+                    if not stall_signaled or (now - last_stall_warning_time) >= 300.0:
+                        if on_stall:
+                            on_stall(elapsed, idle)
+                        stall_signaled = True
+                        last_stall_warning_time = now
 
                 # Periodic heartbeat check
                 elif (

@@ -22,6 +22,7 @@ from rich.table import Table
 from deployx.config import paths
 from deployx.core.command import run_command
 from deployx.core.filesystem import atomic_write_file, ensure_directory, set_secure_permissions
+from deployx.docker.compose import DockerComposeManager, purge_project_resources
 from deployx.core.security import (
     SecurityError,
     format_validation_error,
@@ -171,7 +172,20 @@ def verify_public_repository(repo_url: str, branch: str) -> str:
     try:
         res_head = run_command(cmd_head, timeout=15, check=False)
         if res_head.success and res_head.stdout.strip():
-            raise ValueError(f"Branch '{branch}' was not found in the repository.")
+            avail = []
+            try:
+                res_heads = run_command(["git", "ls-remote", "--heads", repo_url], timeout=15, check=False)
+                if res_heads.success and res_heads.stdout.strip():
+                    for hl in res_heads.stdout.splitlines():
+                        hp = hl.split()
+                        if len(hp) >= 2 and hp[1].startswith("refs/heads/"):
+                            avail.append(hp[1].replace("refs/heads/", ""))
+            except Exception:
+                pass
+            msg = f"Branch '{branch}' was not found in the repository."
+            if avail:
+                msg += f"\nAvailable remote branches:\n" + "\n".join(f"  - {b}" for b in avail[:10])
+            raise ValueError(msg)
     except ValueError:
         raise
     except Exception:
@@ -514,9 +528,12 @@ def show_project_info(project: str, console: Console) -> None:
         f"[bold]Deploy Key:[/bold]          {key_status}",
         f"[bold]Deploy Key Status:[/bold]   {key_status}",
         f"[bold]Framework:[/bold]           {cfg.deployment.framework.value}",
-        f"[bold]Database:[/bold]            {cfg.deployment.database.value}",
+        f"[bold]Expected Database:[/bold]   {cfg.deployment.database.value}",
+        f"[bold]Detected Database:[/bold]   {getattr(state, 'detected_runtime_database', None) or 'Not probed yet'}",
         f"[bold]Custom Domain:[/bold]       {cfg.deployment.domain or 'None'}",
         f"[bold]Compose File:[/bold]        {cfg.deployment.docker.compose_file}",
+        f"[bold]Build Timeout:[/bold]       {str(cfg.deployment.build_timeout) + 's' if cfg.deployment.build_timeout else 'Unlimited'}",
+        f"[bold]Stall Warning:[/bold]       {cfg.deployment.stall_warning_after}s",
         f"[bold]Created At:[/bold]          {created_at_val}",
         f"[bold]Updated At:[/bold]          {updated_at_val}",
     ]
@@ -541,10 +558,15 @@ def show_project_info(project: str, console: Console) -> None:
         f"[bold]Previous Commit:[/bold]     {state.previous_commit or 'None' if state else 'None'}",
         f"[bold]Last Deployed At:[/bold]    {state.deployed_at or 'Never' if state else 'Never'}",
         f"[bold]Docker Image:[/bold]        {state.docker_image or 'None' if state else 'None'}",
+        f"[bold]Previous Image:[/bold]      {getattr(state, 'previous_image', None) or 'None'}",
+        f"[bold]Last Failed Stage:[/bold]   {getattr(state, 'failed_stage', None) or 'None'}",
+        f"[bold]Last Build Step:[/bold]     {getattr(state, 'last_build_step', None) or 'None'}",
+        f"[bold]Last Health Check:[/bold]   {getattr(state, 'last_health_response', None) or 'None'}",
     ])
 
-    if state and state.last_error:
-        info_text.append(f"[bold red]Last Error:[/bold red]         {state.last_error}")
+    if state and (getattr(state, "last_exception_summary", None) or state.last_error):
+        err = getattr(state, "last_exception_summary", None) or state.last_error
+        info_text.append(f"[bold red]Last Error:[/bold red]         {err}")
 
     console.print(
         Panel(
@@ -559,6 +581,10 @@ def remove_project(
     project_name: str,
     purge: bool = False,
     delete_volumes: bool = False,
+    remove_containers: bool = False,
+    remove_images: bool = False,
+    remove_volumes: bool = False,
+    remove_key: bool = False,
     force: bool = False,
     yes: bool = False,
     non_interactive: bool = False,
@@ -571,13 +597,14 @@ def remove_project(
       1. Default (Safe unregister):
          Removes project metadata and state.
          Preserves Docker containers, Docker volumes, backups, and SSH deploy keys.
-      2. Purge runtime resources (--purge):
-         Stops and removes Docker containers and network.
-         Preserves Docker volumes, backups, and SSH deploy keys.
-      3. Destructive volume deletion (--purge --delete-volumes):
-         Permanently deletes Docker volumes and runtime containers.
+      2. Granular options:
+         --remove-containers, --remove-images, --remove-volumes, --remove-key
+      3. Purge runtime resources (--purge):
+         Stops and removes Docker containers, networks, and images.
+         Preserves Docker volumes, backups, and SSH deploy keys (unless specified).
+      4. Destructive volume deletion (--remove-volumes / --delete-volumes):
+         Permanently deletes Docker volumes.
          Requires explicit project name typing (interactive) or --yes (non-interactive).
-         Still preserves backups and SSH deploy keys!
     """
     if console is None:
         console = Console()
@@ -609,9 +636,14 @@ def remove_project(
         console.print(f"[bold red]Error:[/bold red] Project '{valid_name}' is not registered.")
         return False
 
-    # If delete_volumes is specified, purge must be enabled
+    # Resolve actions
     if delete_volumes:
-        purge = True
+        remove_volumes = True
+
+    do_remove_containers = remove_containers or purge
+    do_remove_images = remove_images or purge
+    do_remove_volumes = remove_volumes
+    do_remove_key = remove_key
 
     # Display Project Identity before confirmation (best-effort)
     repo = "Unknown"
@@ -633,8 +665,18 @@ def remove_project(
     if cfg is None and (raw_data is not None or paths.get_project_config_path(valid_name).exists()):
         console.print("[bold yellow]Warning: Project configuration is invalid.[/bold yellow]")
 
+    # Preview removal plan (Requirement 14)
+    console.print(
+        f"[bold cyan]Removal Plan:[/bold cyan]\n"
+        f"  Project:    {valid_name}\n"
+        f"  Containers: {'remove' if do_remove_containers else 'preserve'}\n"
+        f"  Images:     {'remove' if do_remove_images else 'preserve'}\n"
+        f"  Volumes:    {'remove' if do_remove_volumes else 'preserve'}\n"
+        f"  Deploy key: {'remove' if do_remove_key else 'preserve'}\n"
+    )
+
     # Confirmation depending on mode
-    if delete_volumes:
+    if do_remove_volumes:
         console.print(
             "[bold red]WARNING: DESTRUCTIVE OPERATION[/bold red]\n"
             f"This will permanently delete all Docker volumes, database data, and project files for '{valid_name}'.\n"
@@ -654,11 +696,11 @@ def remove_project(
                 console.print("[bold red]Confirmation failed. Project name did not match. Removal aborted.[/bold red]")
                 return False
 
-    elif purge:
+    elif do_remove_containers or do_remove_images or do_remove_key:
         console.print(
-            "This will remove the project registration and stop/remove its Docker containers and network.\n"
-            "Docker volumes and database data will NOT be deleted.\n"
-            "SSH deploy keys and backups will NOT be deleted.\n"
+            "This will remove the project registration and clean designated runtime resources.\n"
+            "Docker volumes and database data will NOT be deleted unless requested.\n"
+            "Backups will NOT be deleted.\n"
         )
         if not force and not yes:
             if non_interactive or not sys.stdin.isatty():
@@ -682,16 +724,48 @@ def remove_project(
                 console.print("[dim]Project removal cancelled.[/dim]")
                 return False
 
-    # Stop runtime containers if purge is enabled
-    if purge:
+    # Stop runtime containers via Compose if available (Requirement 14 & test compatibility)
+    if do_remove_containers:
         try:
             from deployx.docker.compose import DockerComposeManager
             compose_file = paths.get_project_dir(valid_name) / "docker-compose.deployx.yml"
             if compose_file.exists():
                 compose_mgr = DockerComposeManager(valid_name, compose_file=compose_file)
-                compose_mgr.down(volumes=delete_volumes)
+                compose_mgr.down(volumes=do_remove_volumes)
         except Exception as exc:
             console.print(f"[yellow]Warning while stopping containers during purge: {exc}[/yellow]")
+
+    # Purge project resources via Docker labels/prefixes without needing compose file (Requirement 15)
+    try:
+        purge_project_resources(
+            valid_name,
+            remove_containers=do_remove_containers,
+            remove_images=do_remove_images,
+            remove_volumes=do_remove_volumes,
+        )
+    except Exception:
+        pass
+
+    # Remove SSH deploy key if requested
+    key_path = paths.get_project_key_path(valid_name)
+    pub_path = paths.get_project_pubkey_path(valid_name)
+    key_removed = False
+    if do_remove_key:
+        if key_path.exists():
+            key_path.unlink(missing_ok=True)
+            key_removed = True
+        if pub_path.exists():
+            pub_path.unlink(missing_ok=True)
+
+    # Release any open logger handles
+    try:
+        import logging
+        old_logger = logging.getLogger(f"deployx.project.{valid_name}")
+        for h in list(old_logger.handlers):
+            h.close()
+            old_logger.removeHandler(h)
+    except Exception:
+        pass
 
     # Remove project directory
     pdir = paths.get_project_dir(valid_name)
@@ -701,12 +775,28 @@ def remove_project(
     # Delete state
     state_mgr.delete_state(valid_name)
 
-    # Preserve SSH deploy keys and notify user
-    key_path = paths.get_project_key_path(valid_name)
-    if key_path.exists():
+    # Output explicit status table (Requirement 14)
+    status_table = Table(title=f"Removal Status: {valid_name}", show_header=True)
+    status_table.add_column("Component", style="bold")
+    status_table.add_column("Status")
+    status_table.add_row("Registration removed", "[bold green]YES[/bold green]")
+    status_table.add_row("Containers removed", "[bold green]YES[/bold green]" if do_remove_containers else "[yellow]NO[/yellow]")
+    status_table.add_row("Volumes removed", "[bold green]YES[/bold green]" if do_remove_volumes else "[yellow]NO[/yellow]")
+    status_table.add_row("Images removed", "[bold green]YES[/bold green]" if do_remove_images else "[yellow]NO[/yellow]")
+    status_table.add_row("Deploy key removed", "[bold green]YES[/bold green]" if key_removed else "[yellow]NO[/yellow]")
+    console.print(status_table)
+
+    # Preserved SSH deploy keys notice & actionable advice
+    if key_path.exists() and not do_remove_key:
         console.print(
             f"\n[cyan]Deploy key preserved at:[/cyan]\n  {key_path}\n\n"
             f"To remove it:\n  [bold cyan]deployx key remove {valid_name}[/bold cyan]"
+        )
+
+    # Actionable command for remaining images
+    if not do_remove_images:
+        console.print(
+            f"\n[dim]To delete remaining images:\n  docker rmi deployx_{valid_name}:current[/dim]"
         )
 
     # Preserved backups notice
@@ -717,7 +807,7 @@ def remove_project(
             console.print(f"[dim]Project backups preserved in {backup_dir}[/dim]")
 
     try:
-        ProjectLogger(valid_name).info(f"Project '{valid_name}' removed (purge={purge}, delete_volumes={delete_volumes})")
+        ProjectLogger(valid_name).info(f"Project '{valid_name}' removed (purge={purge}, volumes={do_remove_volumes})")
     except Exception:
         pass
 
@@ -742,6 +832,9 @@ def edit_project(
     pip_extra_index_url: Optional[str] = None,
     pip_trusted_host: Optional[str] = None,
     clear_pip_index: bool = False,
+    clear_pip_extra_index: bool = False,
+    clear_pip_trusted_host: bool = False,
+    clear_all_pip_settings: bool = False,
     non_interactive: bool = False,
     yes: bool = False,
     console: Optional[Console] = None,
@@ -846,6 +939,9 @@ def edit_project(
         or pip_extra_index_url is not None
         or pip_trusted_host is not None
         or clear_pip_index
+        or clear_pip_extra_index
+        or clear_pip_trusted_host
+        or clear_all_pip_settings
     )
 
     # Interactive prompt fallback if no flags provided
@@ -937,23 +1033,31 @@ def edit_project(
     target_redis = redis if redis is not None else current_redis
     target_worker = worker if worker is not None else current_worker
 
-    # Resolve target pip mirror parameters
+    # Resolve target pip mirror parameters (Requirement 10)
     target_pip_index = current_pip_index
     target_pip_extra_index = current_pip_extra_index
     target_pip_trusted_host = current_pip_trusted_host
 
-    if clear_pip_index:
+    if clear_all_pip_settings:
         target_pip_index = None
         target_pip_extra_index = None
         target_pip_trusted_host = None
     else:
-        if pip_index_url is not None:
+        if clear_pip_index:
+            target_pip_index = None
+        elif pip_index_url is not None:
             clean_idx = pip_index_url.strip()
             target_pip_index = clean_idx if clean_idx else None
-        if pip_extra_index_url is not None:
+
+        if clear_pip_extra_index:
+            target_pip_extra_index = None
+        elif pip_extra_index_url is not None:
             clean_extra = pip_extra_index_url.strip()
             target_pip_extra_index = clean_extra if clean_extra else None
-        if pip_trusted_host is not None:
+
+        if clear_pip_trusted_host:
+            target_pip_trusted_host = None
+        elif pip_trusted_host is not None:
             clean_host = pip_trusted_host.strip()
             target_pip_trusted_host = clean_host if clean_host else None
 
@@ -1085,8 +1189,13 @@ def edit_project(
 
     proposed_cfg.git.verified = target_verified
 
-    # Atomic write to deployx.yml
+    # Atomic write to deployx.yml with backup (Requirement 11)
     config_file = paths.get_project_config_path(valid_name)
+    try:
+        from deployx.config import backup_project_file
+        backup_project_file(config_file, max_backups=5)
+    except Exception:
+        pass
     atomic_write_file(config_file, proposed_cfg.to_yaml(), mode=0o640)
 
     # Update state
@@ -1254,6 +1363,14 @@ def rename_project(
 
         # 5. Migrate logs if present
         if old_log.exists():
+            try:
+                import logging
+                old_logger = logging.getLogger(f"deployx.project.{valid_old}")
+                for h in list(old_logger.handlers):
+                    h.close()
+                    old_logger.removeHandler(h)
+            except Exception:
+                pass
             shutil.move(str(old_log), str(new_log))
             actions_done.append("move_log")
 

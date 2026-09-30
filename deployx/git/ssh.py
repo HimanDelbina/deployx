@@ -216,14 +216,33 @@ def verify_deploy_key(project_name: str, console: Optional[Console] = None) -> b
             cmd_head = ["git", "ls-remote", repo_url, "HEAD"]
             res_head = run_command(cmd_head, env=test_env, timeout=15)
             if res_head.success and res_head.stdout.strip():
+                # Query available remote branches: git ls-remote --heads <repo> (Requirement 24)
+                available_branches = []
+                try:
+                    cmd_heads = ["git", "ls-remote", "--heads", repo_url]
+                    res_heads = run_command(cmd_heads, env=test_env, timeout=15)
+                    if res_heads.success and res_heads.stdout.strip():
+                        for b_line in res_heads.stdout.splitlines():
+                            b_parts = b_line.split()
+                            if len(b_parts) >= 2 and b_parts[1].startswith("refs/heads/"):
+                                available_branches.append(b_parts[1].replace("refs/heads/", ""))
+                except Exception:
+                    pass
+
+                branches_info = ""
+                suggested_branch = "master" if "master" in available_branches else (available_branches[0] if available_branches else "master")
+                if available_branches:
+                    branch_list_str = "\n".join(f"  - {b}" for b in available_branches[:10])
+                    branches_info = f"\n[bold]Available remote branches:[/bold]\n{branch_list_str}\n"
+
                 if console:
                     console.print(
                         Panel(
                             f"[bold red]Key verification failed:[/bold red]\n\n"
-                            f"Branch '{branch}' was not found in the remote repository.\n\n"
-                            f"[bold yellow]Troubleshooting:[/bold yellow]\n"
-                            f"Verify that branch '{branch}' exists on GitHub or update it with:\n"
-                            f"[bold cyan]deployx project edit {valid_name} --branch <branch>[/bold cyan]",
+                            f"Branch '{branch}' was not found in the remote repository.\n"
+                            f"{branches_info}\n"
+                            f"[bold yellow]Actionable suggestion:[/bold yellow]\n"
+                            f"  [bold cyan]deployx project edit {valid_name} --branch {suggested_branch}[/bold cyan]",
                             title="Branch Not Found",
                             border_style="red",
                         )

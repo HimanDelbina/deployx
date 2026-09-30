@@ -30,17 +30,21 @@ def perform_http_healthcheck(
     timeout: int = 5,
     retries: int = 6,
     interval: int = 3,
+    expected_status: int = 200,
+    details: Optional[dict] = None,
     console: Optional[Console] = None,
 ) -> bool:
     """
-    Polls the local web application port until it responds or retries are exhausted.
-    Accepts any 2xx or 3xx HTTP response, or 401/403/404 as proof the webserver is active.
+    Polls the local web application port until it responds with expected status or retries are exhausted.
+    Captures structured diagnostic details on error.
     """
+    from deployx.core.exceptions import diagnose_health_error
+
     clean_path = ("/" + path.lstrip("/")) if path else "/"
     url = f"http://127.0.0.1:{port}{clean_path}"
 
     if console:
-        console.print(f"[cyan]Verifying health check at {url} (retries: {retries})...[/cyan]")
+        console.print(f"[cyan]Verifying health check at {url} (expected: HTTP {expected_status}, retries: {retries})...[/cyan]")
 
     for attempt in range(1, retries + 1):
         try:
@@ -49,26 +53,87 @@ def perform_http_healthcheck(
                 headers={"User-Agent": "DeployX-HealthCheck/0.1"},
             )
             with urllib.request.urlopen(req, timeout=timeout) as response:
-                code = response.getcode()
-                if 200 <= code < 400:
+                code = None
+                if hasattr(response, "getcode") and callable(response.getcode):
+                    try:
+                        ret = response.getcode()
+                        if isinstance(ret, int):
+                            code = ret
+                    except Exception:
+                        pass
+                if code is None:
+                    status_attr = getattr(response, "status", None)
+                    if isinstance(status_attr, int):
+                        code = status_attr
+                if code is None:
+                    code = 200
+
+                body_sample = ""
+                try:
+                    raw_bytes = response.read(4096)
+                    body_sample = raw_bytes.decode("utf-8", errors="replace")
+                except Exception:
+                    pass
+
+                matches = (code == expected_status) or (expected_status == 200 and 200 <= code < 400)
+                if matches:
                     if console:
                         console.print(f"[green]  Attempt {attempt}/{retries}: Healthy (HTTP {code})[/green]")
+                    if details is not None:
+                        details["last_status"] = code
+                        details["status_code"] = code
+                        details["response_body"] = body_sample
+                        details["response_preview"] = body_sample
+                        details["healthy"] = True
                     return True
+                else:
+                    if details is not None:
+                        details["last_status"] = code
+                        details["status_code"] = code
+                        details["response_body"] = body_sample
+                        details["response_preview"] = body_sample
+                        details["diagnosis"] = f"Received HTTP {code}, expected HTTP {expected_status}."
+                    if console:
+                        console.print(f"[dim]  Attempt {attempt}/{retries}: HTTP {code} (expected {expected_status})...[/dim]")
         except urllib.error.HTTPError as exc:
-            # If server answers with 401/403/404/405, server daemon is up and responding
-            if exc.code in {401, 403, 404, 405}:
+            code = exc.code
+            body_sample = ""
+            try:
+                raw_bytes = exc.read(4096)
+                body_sample = raw_bytes.decode("utf-8", errors="replace")
+            except Exception:
+                pass
+
+            diagnosis = diagnose_health_error(code, str(exc))
+            if details is not None:
+                details["last_status"] = code
+                details["status_code"] = code
+                details["last_error"] = str(exc)
+                details["diagnosis"] = diagnosis
+                details["response_body"] = body_sample
+                details["response_preview"] = body_sample
+
+            if code == expected_status:
                 if console:
-                    console.print(f"[green]  Attempt {attempt}/{retries}: Healthy (Server active, HTTP {exc.code})[/green]")
+                    console.print(f"[green]  Attempt {attempt}/{retries}: Healthy (HTTP {code} matches expected)[/green]")
                 return True
+
             if console:
-                console.print(f"[dim]  Attempt {attempt}/{retries}: Server returned HTTP {exc.code}...[/dim]")
+                console.print(f"[dim]  Attempt {attempt}/{retries}: Server returned HTTP {code} ({diagnosis})...[/dim]")
         except Exception as exc:
+            diagnosis = diagnose_health_error(None, str(exc))
+            if details is not None:
+                details["last_status"] = None
+                details["last_error"] = str(exc)
+                details["diagnosis"] = diagnosis
             if console:
-                console.print(f"[dim]  Attempt {attempt}/{retries}: Waiting for service ({exc})...[/dim]")
+                console.print(f"[dim]  Attempt {attempt}/{retries}: Waiting for service ({diagnosis})...[/dim]")
 
         if attempt < retries:
             time.sleep(interval)
 
+    if details is not None and "diagnosis" not in details:
+        details["diagnosis"] = "Health check timed out: no response from server."
     return False
 
 

@@ -39,6 +39,8 @@ class DeploymentStatus(str, Enum):
     UNHEALTHY = "unhealthy"
     FAILED = "failed"
     STOPPED = "stopped"
+    CANCELLED = "cancelled"
+    TIMED_OUT = "timed_out"
 
 
 class HealthStatus(str, Enum):
@@ -86,6 +88,7 @@ class HealthcheckConfig(BaseModel):
     timeout: int = 10
     retries: int = 6
     interval: int = 5
+    expected_status: int = 200
 
 
 class DockerConfig(BaseModel):
@@ -102,6 +105,9 @@ class DeploymentConfig(BaseModel):
     celery: bool = False
     docker: DockerConfig = Field(default_factory=DockerConfig)
     healthcheck: HealthcheckConfig = Field(default_factory=HealthcheckConfig)
+    build_timeout: int | None = 3600
+    stall_warning_after: int = 120
+    heartbeat_interval: int = 25
 
     @field_validator("domain")
     @classmethod
@@ -180,9 +186,17 @@ class DeploymentState(BaseModel):
     created_at: str | None = None
     updated_at: str | None = None
     docker_image: str | None = None
+    previous_image: str | None = None
     status: DeploymentStatus = DeploymentStatus.PENDING
     health_status: HealthStatus = HealthStatus.UNKNOWN
     last_error: str | None = None
+    failed_stage: str | None = None
+    exit_code: int | None = None
+    timeout_reason: str | None = None
+    last_build_step: str | None = None
+    last_health_response: str | None = None
+    last_exception_summary: str | None = None
+    detected_runtime_database: str | None = None
 
     @classmethod
     def new(cls, project: str, repository: str, branch: str) -> DeploymentState:

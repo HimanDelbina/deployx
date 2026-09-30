@@ -5,6 +5,26 @@ All notable changes to DeployX are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.6] - 2026-09-30
+
+### Added
+- **Configurable Docker Build Timeout**: Replaced hardcoded 1200s timeout with configurable timeout (default 3600s). Supports CLI `--build-timeout <sec>` and `--no-build-timeout` (unlimited), project config `deployment.build_timeout`, and global config `/etc/deployx/config.yml`. Strict resolution hierarchy: CLI > Project > Global > Default.
+- **Docker Compose Progress Flag Ordering**: Fixed modern Docker Compose flag warning by placing `--progress=plain` before `-f` (`docker compose --progress=plain -f file.yml build`).
+- **BuildKit Responsiveness & Rate-Limited Stall Alerts**: Added state tracking (`ACTIVE`, `SLOW`, `STALLED`) and rate-limited stall warning panels to at most 1 every 300s to eliminate terminal spam.
+- **Granular Pip Mirror Clearing**: Added `--clear-pip-index`, `--clear-pip-extra-index`, `--clear-pip-trusted-host`, and `--clear-all-pip-settings` flags to `deployx project edit`.
+- **Atomic Project Config Backups**: Automatically backs up project configuration before edits to `<project>/backups/` with secure 0600 mode and automatic 5-file rotation.
+- **Django Runtime Database Probe & Backend Mismatch Guard**: Executes an in-container runtime preflight query (`django.db.connection.vendor`) before migrations run, safely aborting deployment if PostgreSQL was requested but SQLite is active at runtime.
+- **Django Production Safety Checks**: Automatically warns during deployment when `DEBUG=True` or empty/wildcard `ALLOWED_HOSTS` are detected in production settings.
+- **HTTP Health Check Diagnostics & Classification**: Added `expected_status` (default 200), detailed error classification (connection refused, timeouts, bad gateways, 500 internal errors).
+- **Technical 500 HTML & Container Traceback Root-Cause Extractor**: Safely extracts root exception and application call site from Django HTML debug pages and traceback logs while strictly redacting database passwords, tokens, and secret keys.
+- **Rollback Workflow (`deployx rollback <project>`)**: Automated one-command rollback to previous known-good commit and image tag (`deployx_<project>:previous`).
+- **Deterministic Docker Labels & Compose-Free Resource Purge**: Standardized labels (`com.deployx.managed=true`, `com.deployx.project`, `com.deployx.version`), enabling complete cleanup of orphaned containers, images, volumes, and networks even if compose files are absent.
+- **Granular Project Removal**: Enhanced `deployx project remove` with `--remove-containers`, `--remove-images`, `--remove-volumes`, `--remove-key`, `--purge`, displaying clear removal plan preview and summary table.
+- **Doctor Diagnostics & Project Doctor**: Added `deployx doctor --orphans`, `--docker-network`, and dedicated per-project health checks via `deployx project doctor <project> [--network]`.
+- **Project Log Rotation & Structured Audit Events**: Integrated `RotatingFileHandler` (10MB max, 5 backups) and structured audit events with automatic secret redaction.
+
+---
+
 ## [0.1.5] - 2026-09-29
 
 ### Added

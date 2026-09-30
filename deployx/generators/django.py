@@ -132,13 +132,26 @@ def generate_compose_file(
         # Reference generated Dockerfile
         dockerfile_rel = "../Dockerfile.deployx"
 
+    from deployx import __version__
+
     health_path = project_config.deployment.healthcheck.path or "/"
     web_port = project_config.deployment.docker.port
+    deployx_labels = {
+        "com.deployx.managed": "true",
+        "com.deployx.project": pname,
+        "com.deployx.version": __version__,
+    }
 
     services: Dict[str, Any] = {}
     volumes: Dict[str, Any] = {
-        "static_volume": {"name": f"deployx_{pname}_static"},
-        "media_volume": {"name": f"deployx_{pname}_media"},
+        "static_volume": {
+            "name": f"deployx_{pname}_static",
+            "labels": deployx_labels.copy(),
+        },
+        "media_volume": {
+            "name": f"deployx_{pname}_media",
+            "labels": deployx_labels.copy(),
+        },
     }
 
     # 1. Web application service
@@ -155,6 +168,7 @@ def generate_compose_file(
         },
         "container_name": f"deployx_{pname}_web",
         "restart": "unless-stopped",
+        "labels": deployx_labels.copy(),
         "env_file": [".env.production"],
         "ports": [f"127.0.0.1:{web_port}:8000"],
         "volumes": [
@@ -182,6 +196,7 @@ def generate_compose_file(
             "image": "postgres:16-alpine",
             "container_name": f"deployx_{pname}_db",
             "restart": "unless-stopped",
+            "labels": deployx_labels.copy(),
             "env_file": [".env.production"],
             "volumes": ["postgres_data:/var/lib/postgresql/data"],
             "networks": ["deployx_network"],
@@ -192,7 +207,10 @@ def generate_compose_file(
                 "retries": 5,
             },
         }
-        volumes["postgres_data"] = {"name": f"deployx_{pname}_pgdata"}
+        volumes["postgres_data"] = {
+            "name": f"deployx_{pname}_pgdata",
+            "labels": deployx_labels.copy(),
+        }
         depends_on["db"] = {"condition": "service_healthy"}
 
     # 3. Redis service
@@ -201,6 +219,7 @@ def generate_compose_file(
             "image": "redis:7-alpine",
             "container_name": f"deployx_{pname}_redis",
             "restart": "unless-stopped",
+            "labels": deployx_labels.copy(),
             "volumes": ["redis_data:/data"],
             "networks": ["deployx_network"],
             "healthcheck": {
@@ -210,7 +229,10 @@ def generate_compose_file(
                 "retries": 3,
             },
         }
-        volumes["redis_data"] = {"name": f"deployx_{pname}_redisdata"}
+        volumes["redis_data"] = {
+            "name": f"deployx_{pname}_redisdata",
+            "labels": deployx_labels.copy(),
+        }
         depends_on["redis"] = {"condition": "service_healthy"}
 
     if depends_on:
@@ -224,6 +246,7 @@ def generate_compose_file(
             "deployx_network": {
                 "name": f"deployx_{pname}_net",
                 "driver": "bridge",
+                "labels": deployx_labels.copy(),
             }
         },
     }

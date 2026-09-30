@@ -21,6 +21,8 @@ from deployx.state import get_state_manager
 
 def run_update(
     project_name: str,
+    build_timeout: Optional[int] = None,
+    no_build_timeout: bool = False,
     verbose: bool = False,
     plain: bool = False,
     regenerate: bool = False,
@@ -129,11 +131,17 @@ def run_update(
         )
 
     # Trigger deployment for the new commit
-    deploy_kwargs = {"console": console}
+    deploy_kwargs = {
+        "console": console,
+    }
     if verbose:
         deploy_kwargs["verbose"] = True
     if plain:
         deploy_kwargs["plain"] = True
     if regenerate:
         deploy_kwargs["regenerate"] = True
+    if build_timeout is not None:
+        deploy_kwargs["build_timeout"] = build_timeout
+    if no_build_timeout:
+        deploy_kwargs["no_build_timeout"] = True
     return run_deployment(valid_name, target_commit=remote_sha, **deploy_kwargs)
