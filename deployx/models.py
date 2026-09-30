@@ -19,6 +19,8 @@ class FrameworkType(str, Enum):
     DJANGO = "django"
     FASTAPI = "fastapi"
     FLASK = "flask"
+    GENERIC_PYTHON = "generic_python"
+    PYTHON = "python"
     NODE = "node"
     CUSTOM = "custom"
 
@@ -32,15 +34,20 @@ class DatabasePreference(str, Enum):
 
 class DeploymentStatus(str, Enum):
     PENDING = "pending"
+    QUEUED = "queued"
+    STARTING = "starting"
+    ACTIVE = "active"
+    SLOW = "slow"
+    STALLED = "stalled"
     BUILDING = "building"
     MIGRATING = "migrating"
-    STARTING = "starting"
     HEALTHY = "healthy"
     UNHEALTHY = "unhealthy"
     FAILED = "failed"
     STOPPED = "stopped"
     CANCELLED = "cancelled"
     TIMED_OUT = "timed_out"
+    SUCCEEDED = "succeeded"
 
 
 class HealthStatus(str, Enum):
@@ -106,8 +113,17 @@ class DeploymentConfig(BaseModel):
     docker: DockerConfig = Field(default_factory=DockerConfig)
     healthcheck: HealthcheckConfig = Field(default_factory=HealthcheckConfig)
     build_timeout: int | None = 3600
+    absolute_build_timeout: int | None = 7200
+    inactivity_timeout: int | None = 600
     stall_warning_after: int = 120
     heartbeat_interval: int = 25
+    auto_rollback: bool = True
+    auto_branch: bool = True
+    python_version: str | None = None
+    package_manager: str | None = None
+    proxy_enabled: bool = False
+    media_volume: bool = False
+    env_secrets: dict[str, str] = Field(default_factory=dict)
 
     @field_validator("domain")
     @classmethod
@@ -173,6 +189,16 @@ class ProjectConfig(BaseModel):
         return cls.model_validate(raw_data)
 
 
+class DeploymentEvent(BaseModel):
+    """Structured audit and timeline event for deployment tracking."""
+    timestamp: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    project: str
+    stage: str
+    status: str
+    message: str
+    details: dict[str, Any] = Field(default_factory=dict)
+
+
 class DeploymentState(BaseModel):
     """
     Schema for persistent deployment tracking (/opt/deployx/state/<name>.state.json)
@@ -187,6 +213,7 @@ class DeploymentState(BaseModel):
     updated_at: str | None = None
     docker_image: str | None = None
     previous_image: str | None = None
+    candidate_image: str | None = None
     status: DeploymentStatus = DeploymentStatus.PENDING
     health_status: HealthStatus = HealthStatus.UNKNOWN
     last_error: str | None = None
@@ -197,6 +224,30 @@ class DeploymentState(BaseModel):
     last_health_response: str | None = None
     last_exception_summary: str | None = None
     detected_runtime_database: str | None = None
+    detected_framework: str | None = None
+    detected_python_version: str | None = None
+    detected_package_manager: str | None = None
+    detected_health_endpoint: str | None = None
+    proxy_domain: str | None = None
+    timeline: list[dict[str, Any]] = Field(default_factory=list)
+
+    def record_event(
+        self,
+        stage: str,
+        status: str,
+        message: str,
+        details: dict[str, Any] | None = None,
+    ) -> DeploymentEvent:
+        event = DeploymentEvent(
+            project=self.project,
+            stage=stage,
+            status=status,
+            message=message,
+            details=details or {},
+        )
+        self.timeline.append(event.model_dump(mode="json"))
+        self.updated_at = event.timestamp
+        return event
 
     @classmethod
     def new(cls, project: str, repository: str, branch: str) -> DeploymentState:

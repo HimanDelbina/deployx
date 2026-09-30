@@ -102,6 +102,15 @@ def load_project_config(project_name: str) -> ProjectConfig:
     return ProjectConfig.model_validate(raw_data)
 
 
+def save_project_config(config: ProjectConfig) -> None:
+    """
+    Saves a ProjectConfig model back to its deployx.yml file atomically with secure permissions.
+    """
+    config_file = paths.get_project_config_path(config.project.name)
+    atomic_write_file(config_file, config.to_yaml(), mode=0o640)
+
+
+
 class ProjectConfigInspection:
     """Inspection container holding validation diagnostics and raw/validated models."""
     def __init__(
@@ -360,23 +369,32 @@ def add_project(
     return config
 
 
-def list_projects(console: Console) -> None:
+def list_projects(console: Console, json_format: bool = False) -> None:
     """
     Lists all registered projects, verification state, and deployment status.
     Never silently hides projects whose configuration contains validation errors;
     displays them with INVALID_CONFIG status so administrators can inspect or repair them.
+    Supports structured JSON output via json_format.
     """
     projects_dir = paths.projects_dir
     try:
         if not projects_dir.exists():
-            console.print("[dim]No projects registered yet. Run 'deployx project add' to register one.[/dim]")
+            if json_format:
+                import json
+                console.print(json.dumps([]))
+            else:
+                console.print("[dim]No projects registered yet. Run 'deployx project add' to register one.[/dim]")
             return
         subdirs = [p for p in projects_dir.iterdir() if p.is_dir()]
     except PermissionError as exc:
         raise PermissionError(str(projects_dir)) from exc
 
     if not subdirs:
-        console.print("[dim]No projects registered yet. Run 'deployx project add' to register one.[/dim]")
+        if json_format:
+            import json
+            console.print(json.dumps([]))
+        else:
+            console.print("[dim]No projects registered yet. Run 'deployx project add' to register one.[/dim]")
         return
 
     table = Table(show_header=True, header_style="bold magenta")
@@ -391,6 +409,7 @@ def list_projects(console: Console) -> None:
 
     state_mgr = get_state_manager()
     found = 0
+    json_list: list[dict[str, Any]] = []
 
     for pdir in sorted(subdirs):
         cfg_file = pdir / "deployx.yml"
@@ -432,6 +451,16 @@ def list_projects(console: Console) -> None:
                 commit,
                 repo_display,
             )
+            json_list.append({
+                "name": cfg.project.name,
+                "framework": cfg.deployment.framework.value,
+                "branch": cfg.git.branch,
+                "private": cfg.git.private,
+                "verified": getattr(cfg.git, "verified", False),
+                "status": status,
+                "commit": commit,
+                "repository": cfg.git.repository,
+            })
         else:
             # Broken / Invalid Project Configuration
             raw = inspection.raw_data or {}
@@ -461,6 +490,21 @@ def list_projects(console: Console) -> None:
                 commit,
                 repo_display,
             )
+            json_list.append({
+                "name": str(name_display),
+                "framework": str(fw_display),
+                "branch": str(branch_display),
+                "private": private_val,
+                "verified": False,
+                "status": "INVALID_CONFIG",
+                "commit": None,
+                "repository": str(raw_git.get("repository") or ""),
+            })
+
+    if json_format:
+        import json
+        console.print(json.dumps(json_list, indent=2))
+        return
 
     if found == 0:
         console.print("[dim]No projects registered yet. Run 'deployx project add' to register one.[/dim]")
@@ -469,7 +513,7 @@ def list_projects(console: Console) -> None:
     console.print(table)
 
 
-def show_project_info(project: str, console: Console) -> None:
+def show_project_info(project: str, console: Console, json_format: bool = False) -> None:
     """
     Displays detailed configuration, paths, and deployment metadata for a project.
     Catches and formats invalid configurations cleanly without raw tracebacks.
@@ -510,6 +554,28 @@ def show_project_info(project: str, console: Console) -> None:
 
     state_mgr = get_state_manager()
     state = state_mgr.get_state(valid_name)
+
+    if json_format:
+        import json
+        info_dict = {
+            "name": cfg.project.name,
+            "directory": str(paths.get_project_dir(valid_name)),
+            "repository": cfg.git.repository,
+            "branch": cfg.git.branch,
+            "private": cfg.git.private,
+            "verified": getattr(cfg.git, "verified", False),
+            "framework": cfg.deployment.framework.value,
+            "database": cfg.deployment.database.value,
+            "domain": cfg.deployment.domain,
+            "status": state.status.value if state else "pending",
+            "health_status": state.health_status.value if state else "unknown",
+            "current_commit": state.current_commit if state else None,
+            "previous_commit": state.previous_commit if state else None,
+            "docker_image": state.docker_image if state else None,
+            "deployed_at": state.deployed_at if state else None,
+        }
+        console.print(json.dumps(info_dict, indent=2))
+        return
 
     key_path = paths.get_project_key_path(valid_name)
     has_key = key_path.is_file()
@@ -1398,3 +1464,137 @@ def rename_project(
 
     console.print(f"[bold green]Project '{valid_old}' successfully renamed to '{valid_new}'.[/bold green]")
     return True
+
+
+def get_project_timeline(project_name: str) -> list[dict[str, Any]]:
+    """Retrieves deployment timeline events for a project."""
+    valid_name = validate_project_name(project_name)
+    state = get_state_manager().get_state(valid_name)
+    return state.timeline if state else []
+
+
+def show_project_timeline(
+    project_name: str,
+    limit: Optional[int] = None,
+    json_format: bool = False,
+    console: Optional[Console] = None,
+) -> None:
+    """Renders formatted or JSON deployment timeline events."""
+    if console is None:
+        console = Console()
+    valid_name = validate_project_name(project_name)
+    events = get_project_timeline(valid_name)
+    if limit and limit > 0:
+        events = events[-limit:]
+
+    if json_format:
+        import json
+        console.print(json.dumps(events, indent=2))
+        return
+
+    if not events:
+        console.print(f"[dim]No timeline events recorded for project '{valid_name}'.[/dim]")
+        return
+
+    table = Table(title=f"Deployment Timeline: {valid_name}", show_header=True, header_style="bold magenta")
+    table.add_column("Timestamp", style="dim", width=20)
+    table.add_column("Stage", style="bold cyan", width=16)
+    table.add_column("Status", width=12)
+    table.add_column("Message", style="white")
+
+    for ev in events:
+        st = ev.get("status", "unknown")
+        if st in ("success", "healthy", "passed"):
+            st_fmt = "[green]SUCCESS[/green]"
+        elif st in ("failed", "error"):
+            st_fmt = "[red]FAILED[/red]"
+        elif st in ("started", "running"):
+            st_fmt = "[yellow]STARTED[/yellow]"
+        elif st in ("retry", "retrying"):
+            st_fmt = "[yellow]RETRY[/yellow]"
+        else:
+            st_fmt = f"[cyan]{st.upper()}[/cyan]"
+
+        table.add_row(
+            ev.get("timestamp", "")[:19],
+            ev.get("stage", ""),
+            st_fmt,
+            ev.get("message", ""),
+        )
+
+    console.print(table)
+
+
+def inspect_project_details(project_name: str) -> dict[str, Any]:
+    """Collects comprehensive deep inspection dictionary for a project."""
+    valid_name = validate_project_name(project_name)
+    inspection = inspect_project_config(valid_name)
+    state = get_state_manager().get_state(valid_name)
+
+    res: dict[str, Any] = {
+        "project": valid_name,
+        "valid_config": inspection.valid,
+        "config": inspection.config.model_dump(mode="json") if inspection.config else inspection.raw_data,
+        "state": state.model_dump(mode="json") if state else None,
+    }
+
+    if inspection.config and inspection.config.deployment:
+        res["env_secrets_keys"] = list(inspection.config.deployment.env_secrets.keys())
+
+    from deployx.docker.compose import find_managed_containers
+    try:
+        res["containers"] = [c for c in find_managed_containers() if valid_name in c.get("name", "")]
+    except Exception:
+        res["containers"] = []
+    return res
+
+
+def show_project_inspect(
+    project_name: str,
+    json_format: bool = False,
+    console: Optional[Console] = None,
+) -> None:
+    """Displays deep project inspection details in Rich panels or JSON."""
+    if console is None:
+        console = Console()
+    details = inspect_project_details(project_name)
+
+    if json_format:
+        import json
+        console.print(json.dumps(details, indent=2))
+        return
+
+    console.print(f"\n[bold cyan]Deep Inspection for '{project_name}'[/bold cyan]\n")
+    st = details.get("state") or {}
+
+    table = Table(title="Project Overview", show_header=False)
+    table.add_column("Key", style="bold cyan")
+    table.add_column("Value")
+    table.add_row("Project Name", details.get("project", ""))
+    table.add_row("Configuration Valid", "[green]Yes[/green]" if details.get("valid_config") else "[red]No[/red]")
+    if st:
+        table.add_row("Deployment Status", st.get("status", "unknown"))
+        table.add_row("Current Commit", st.get("current_commit") or "None")
+        table.add_row("Docker Image", st.get("docker_image") or "None")
+        table.add_row("Health Status", st.get("health_status", "unknown"))
+        table.add_row("Detected Framework", st.get("detected_framework") or "unknown")
+        table.add_row("Detected Python", st.get("detected_python_version") or "unknown")
+        table.add_row("Detected Package Mgr", st.get("detected_package_manager") or "unknown")
+        table.add_row("Timeline Events", str(len(st.get("timeline", []))))
+    console.print(table)
+
+    secrets = details.get("env_secrets_keys", [])
+    if secrets:
+        console.print(f"\n[bold]Configured Secrets (keys only):[/bold] {', '.join(secrets)}")
+
+    containers = details.get("containers", [])
+    if containers:
+        ctable = Table(title="Managed Containers", show_header=True, header_style="bold magenta")
+        ctable.add_column("ID", style="dim")
+        ctable.add_column("Name", style="bold")
+        ctable.add_column("Status")
+        ctable.add_column("Ports")
+        for c in containers:
+            ctable.add_row(c.get("id", "")[:12], c.get("name", ""), c.get("status", ""), c.get("ports", ""))
+        console.print(ctable)
+

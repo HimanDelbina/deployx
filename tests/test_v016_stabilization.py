@@ -23,6 +23,7 @@ import pytest
 from typer.testing import CliRunner
 from rich.console import Console
 
+from deployx import __version__
 from deployx.cli import app
 from deployx.config import (
     paths,
@@ -498,7 +499,7 @@ def test_generate_compose_includes_management_labels(tmp_path):
     web_labels = data["services"]["web"]["labels"]
     assert web_labels["com.deployx.managed"] == "true"
     assert web_labels["com.deployx.project"] == "labelproj"
-    assert web_labels["com.deployx.version"] == "0.1.6"
+    assert web_labels["com.deployx.version"] == __version__
 
 
 def test_compose_free_resource_purge(mocker):

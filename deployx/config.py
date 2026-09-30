@@ -246,3 +246,145 @@ def backup_project_file(file_path: Path, max_backups: int = 5) -> Optional[Path]
                 pass
 
     return backup_file
+
+
+def _cast_config_val(val_str: str) -> Any:
+    """Intelligently casts string values to int, bool, float, or stripped string."""
+    clean = val_str.strip()
+    if clean.lower() in ("true", "yes", "on"):
+        return True
+    if clean.lower() in ("false", "no", "off"):
+        return False
+    if clean.lower() in ("null", "none"):
+        return None
+    try:
+        return int(clean)
+    except ValueError:
+        pass
+    try:
+        return float(clean)
+    except ValueError:
+        pass
+    return clean
+
+
+def set_nested_key(data: dict[str, Any], dotted_key: str, val: Any) -> None:
+    parts = dotted_key.split(".")
+    curr = data
+    for part in parts[:-1]:
+        if part not in curr or not isinstance(curr[part], dict):
+            curr[part] = {}
+        curr = curr[part]
+    curr[parts[-1]] = val
+
+
+def unset_nested_key(data: dict[str, Any], dotted_key: str) -> bool:
+    parts = dotted_key.split(".")
+    curr = data
+    for part in parts[:-1]:
+        if part not in curr or not isinstance(curr[part], dict):
+            return False
+        curr = curr[part]
+    if parts[-1] in curr:
+        del curr[parts[-1]]
+        return True
+    return False
+
+
+def save_global_config(data: dict[str, Any]) -> None:
+    import yaml
+    from deployx.core.filesystem import atomic_write_file, ensure_directory
+    ensure_directory(paths.config_dir, mode=0o755)
+    cfg_file = paths.config_dir / "config.yml"
+    content = yaml.dump(data, sort_keys=False, default_flow_style=False)
+    atomic_write_file(cfg_file, content, mode=0o644)
+
+
+def set_global_config_value(dotted_key: str, value_str: str) -> dict[str, Any]:
+    cfg = load_global_config()
+    val = _cast_config_val(value_str)
+    set_nested_key(cfg, dotted_key, val)
+    save_global_config(cfg)
+    return cfg
+
+
+def unset_global_config_value(dotted_key: str) -> dict[str, Any]:
+    cfg = load_global_config()
+    unset_nested_key(cfg, dotted_key)
+    save_global_config(cfg)
+    return cfg
+
+
+def reset_global_config() -> dict[str, Any]:
+    default_cfg: dict[str, Any] = {
+        "deployment": {
+            "build_timeout": 7200,
+            "auto_rollback": True,
+        },
+        "network": {
+            "python": {
+                "auto_select_mirror": True,
+                "candidates": [
+                    "https://pypi.org/simple/",
+                    "https://mirrors.aliyun.com/pypi/simple/",
+                    "https://pypi.tuna.tsinghua.edu.cn/simple/",
+                ],
+            }
+        },
+    }
+    save_global_config(default_cfg)
+    return default_cfg
+
+
+def set_project_config_value(project_name: str, dotted_key: str, value_str: str) -> dict[str, Any]:
+    import yaml
+    from deployx.core.filesystem import atomic_write_file
+    cfg_path = paths.get_project_config_path(project_name)
+    if not cfg_path.is_file():
+        raise FileNotFoundError(f"Project '{project_name}' configuration not found at {cfg_path}")
+    backup_project_file(cfg_path)
+    raw = yaml.safe_load(cfg_path.read_text(encoding="utf-8")) or {}
+    val = _cast_config_val(value_str)
+    set_nested_key(raw, dotted_key, val)
+    atomic_write_file(cfg_path, yaml.dump(raw, sort_keys=False, default_flow_style=False), mode=0o640)
+    return raw
+
+
+def unset_project_config_value(project_name: str, dotted_key: str) -> dict[str, Any]:
+    import yaml
+    from deployx.core.filesystem import atomic_write_file
+    cfg_path = paths.get_project_config_path(project_name)
+    if not cfg_path.is_file():
+        raise FileNotFoundError(f"Project '{project_name}' configuration not found at {cfg_path}")
+    backup_project_file(cfg_path)
+    raw = yaml.safe_load(cfg_path.read_text(encoding="utf-8")) or {}
+    unset_nested_key(raw, dotted_key)
+    atomic_write_file(cfg_path, yaml.dump(raw, sort_keys=False, default_flow_style=False), mode=0o640)
+    return raw
+
+
+def migrate_project_config_schema(project_name: str) -> bool:
+    """
+    Safely migrates project configuration schema to DeployX v0.2.0:
+    - Backs up current config.
+    - Sets version = 2.
+    - Fills in default v0.2.0 zero-touch deployment fields.
+    """
+    import yaml
+    from deployx.core.filesystem import atomic_write_file
+    cfg_path = paths.get_project_config_path(project_name)
+    if not cfg_path.is_file():
+        return False
+    backup_project_file(cfg_path)
+    raw = yaml.safe_load(cfg_path.read_text(encoding="utf-8")) or {}
+    raw["version"] = 2
+    if not isinstance(raw.get("deployment"), dict):
+        raw["deployment"] = {}
+    dep = raw["deployment"]
+    dep.setdefault("auto_rollback", True)
+    dep.setdefault("auto_branch", True)
+    dep.setdefault("absolute_build_timeout", 7200)
+    dep.setdefault("inactivity_timeout", 600)
+    atomic_write_file(cfg_path, yaml.dump(raw, sort_keys=False, default_flow_style=False), mode=0o640)
+    return True
+

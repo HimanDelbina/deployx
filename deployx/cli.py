@@ -7,9 +7,11 @@ from __future__ import annotations
 
 import functools
 import sys
-from typing import Optional
+from typing import List, Optional
 import typer
 from rich.console import Console
+from rich.panel import Panel
+from rich.table import Table
 from pydantic import ValidationError
 
 from deployx import __version__
@@ -40,7 +42,6 @@ def handle_cli_exceptions(func):
             target_path = getattr(exc, "filename", None) or str(exc)
             if not target_path or target_path.startswith("[Errno"):
                 target_path = "/opt/deployx/projects"
-            # Format clean advice for elevated privileges
             cmd_invoked = None
             if len(sys.argv) > 1 and not any("pytest" in arg for arg in sys.argv):
                 cmd_invoked = " ".join(sys.argv[1:])
@@ -62,8 +63,9 @@ def handle_cli_exceptions(func):
                 elif fn_name.startswith("key_"):
                     sub = fn_name.replace("key_", "")
                     cmd_invoked = f"key {sub} {project_arg}".strip()
-                elif fn_name in ("deploy", "update", "status", "logs", "restart", "stop", "start", "doctor"):
-                    cmd_invoked = f"{fn_name} {project_arg}".strip()
+                elif fn_name in ("deploy", "update", "status", "logs", "restart", "stop", "start", "doctor", "events", "inspect", "cleanup", "explain", "init_cmd"):
+                    cmd_name = "init" if fn_name == "init_cmd" else fn_name
+                    cmd_invoked = f"{cmd_name} {project_arg}".strip()
                 else:
                     cmd_invoked = "<command>"
 
@@ -94,16 +96,22 @@ def handle_cli_exceptions(func):
 
 app = typer.Typer(
     name="deployx",
-    help="DeployX: Production-Grade Deployment Manager for Ubuntu Linux servers.",
+    help="DeployX: Production-Grade Zero-Touch Deployment Manager for Ubuntu Linux servers.",
     no_args_is_help=True,
     add_completion=False,
 )
 
 project_app = typer.Typer(help="Manage registered projects", no_args_is_help=True)
 key_app = typer.Typer(help="Manage per-project SSH deploy keys", no_args_is_help=True)
+config_app = typer.Typer(help="Manage DeployX global configuration", no_args_is_help=True)
+project_config_app = typer.Typer(help="Manage per-project configuration", no_args_is_help=True)
+domain_app = typer.Typer(help="Manage domain routing and reverse proxy", no_args_is_help=True)
 
 app.add_typer(project_app, name="project")
 app.add_typer(key_app, name="key")
+app.add_typer(config_app, name="config")
+project_app.add_typer(project_config_app, name="config")
+app.add_typer(domain_app, name="domain")
 
 
 def version_callback(value: bool):
@@ -130,6 +138,23 @@ def main(
 
 
 # ----------------------------------------------------------------------
+# Init Command
+# ----------------------------------------------------------------------
+@app.command("init")
+@handle_cli_exceptions
+def init_cmd(
+    non_interactive: bool = typer.Option(False, "--non-interactive", help="Run initial server setup without prompts"),
+):
+    """
+    Initialize DeployX on this server: verify directories, permissions, PyPI mirrors, and global configuration.
+    """
+    from deployx.init_wizard import run_init_wizard
+    success = run_init_wizard(non_interactive=non_interactive, console=console)
+    if not success:
+        raise typer.Exit(1)
+
+
+# ----------------------------------------------------------------------
 # Doctor
 # ----------------------------------------------------------------------
 @app.command("doctor")
@@ -137,12 +162,13 @@ def main(
 def doctor(
     docker_network: bool = typer.Option(False, "--docker-network", help="Test in-container outbound DNS and network reachability"),
     orphans: bool = typer.Option(False, "--orphans", help="Scan for orphan Docker containers, volumes, and images"),
+    json_output: bool = typer.Option(False, "--json", help="Output results in JSON format"),
 ):
     """
     Diagnose Ubuntu server environment, Docker, Git, Python, permissions, and directories.
     """
     from deployx.doctor.checks import run_doctor
-    success = run_doctor(console, check_network=docker_network, orphans=orphans)
+    success = run_doctor(console, check_network=docker_network, orphans=orphans, json_format=json_output)
     if not success:
         raise typer.Exit(1)
 
@@ -296,22 +322,27 @@ def project_rename(
 
 @project_app.command("list")
 @handle_cli_exceptions
-def project_list():
+def project_list(
+    json_output: bool = typer.Option(False, "--json", help="Output in JSON format"),
+):
     """
     List all registered projects and their current status.
     """
     from deployx.deployment.project import list_projects
-    list_projects(console)
+    list_projects(console, json_format=json_output)
 
 
 @project_app.command("info")
 @handle_cli_exceptions
-def project_info(project: str = typer.Argument(..., help="Project name")):
+def project_info(
+    project: str = typer.Argument(..., help="Project name"),
+    json_output: bool = typer.Option(False, "--json", help="Output in JSON format"),
+):
     """
     Display configuration and deployment metadata for a project.
     """
     from deployx.deployment.project import show_project_info
-    show_project_info(project, console)
+    show_project_info(project, console, json_format=json_output)
 
 
 @project_app.command("doctor")
@@ -395,22 +426,45 @@ def key_remove(
 @app.command("deploy")
 @handle_cli_exceptions
 def deploy(
-    project: str = typer.Argument(..., help="Project name"),
+    project: str = typer.Argument(..., help="Project name or Git repository URL"),
     build_timeout: Optional[int] = typer.Option(None, "--build-timeout", help="Docker build timeout in seconds"),
     no_build_timeout: bool = typer.Option(False, "--no-build-timeout", help="Disable Docker build timeout (unlimited duration)"),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Simulate deployment and preview architectural plan without modifying server"),
+    explain: bool = typer.Option(False, "--explain", help="Display detector analysis rationale and architectural decisions"),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Confirm plan preview and prompts automatically"),
+    non_interactive: bool = typer.Option(False, "--non-interactive", help="Run without interactive confirmation prompts"),
+    domain: Optional[str] = typer.Option(None, "--domain", "-d", help="Custom domain for reverse proxy routing"),
+    auto_rollback: Optional[bool] = typer.Option(None, "--auto-rollback/--no-auto-rollback", help="Toggle automatic rollback on deployment failure"),
+    auto_branch: Optional[bool] = typer.Option(None, "--auto-branch/--no-auto-branch", help="Toggle automatic branch tracking"),
+    env_secret: Optional[List[str]] = typer.Option(None, "--env-secret", help="Set environment secret in KEY=VALUE format"),
     verbose: bool = typer.Option(False, "--verbose", "-V", help="Show detailed command and build output"),
     plain: bool = typer.Option(False, "--plain", help="Plain text output without live redraws (recommended for CI)"),
     no_progress: bool = typer.Option(False, "--no-progress", help="Disable live progress bar"),
     regenerate: bool = typer.Option(False, "--regenerate", help="Force regeneration of DeployX-owned deployment files"),
 ):
     """
-    Execute full deployment pipeline for a registered project.
+    Execute full deployment pipeline for a registered project or Git URL.
     """
     from deployx.deployment.deploy import run_deployment
+
+    parsed_secrets: dict[str, str] = {}
+    if env_secret:
+        for s in env_secret:
+            if "=" in s:
+                k, v = s.split("=", 1)
+                parsed_secrets[k.strip()] = v.strip()
+
     deploy_kwargs = {
         "verbose": verbose,
         "plain": (plain or no_progress),
         "regenerate": regenerate,
+        "dry_run": dry_run,
+        "explain": explain,
+        "yes": yes,
+        "non_interactive": non_interactive,
+        "domain": domain,
+        "auto_rollback": auto_rollback,
+        "env_secrets": parsed_secrets if parsed_secrets else None,
         "console": console,
     }
     if build_timeout is not None:
@@ -477,6 +531,276 @@ def rollback(
         raise typer.Exit(1)
 
 
+@app.command("explain")
+@handle_cli_exceptions
+def explain(
+    project: str = typer.Argument(..., help="Project name"),
+):
+    """
+    Display framework, Python, dependency, and infrastructure detector rationale for a project.
+    """
+    from deployx.config import paths
+    from deployx.core.security import validate_project_name
+    from deployx.detectors.registry import detect_repository
+
+    valid_name = validate_project_name(project)
+    repo_dir = paths.get_project_repo_dir(valid_name)
+    if not repo_dir.is_dir():
+        console.print(f"[bold red]Error:[/bold red] Repository for '{valid_name}' has not been synced yet.")
+        raise typer.Exit(1)
+
+    detection = detect_repository(repo_dir)
+    tbl = Table(title=f"Detection Explanation: {valid_name}", show_header=True, header_style="bold magenta")
+    tbl.add_column("Component", style="bold cyan")
+    tbl.add_column("Decision")
+    tbl.add_column("Rationale", style="white")
+
+    expl = detection.explanation
+    tbl.add_row("Framework", detection.framework.value, expl.get("framework_reason", "-"))
+    tbl.add_row("Python Version", detection.infrastructure.selected_python_version or "3.12", expl.get("python_version_reason", "-"))
+    tbl.add_row("Package Manager", detection.infrastructure.package_manager or "pip", expl.get("package_manager_reason", "-"))
+    tbl.add_row("Database", expl.get("database_reason", "-"))
+    tbl.add_row("Workers", expl.get("workers_reason", "-"))
+    tbl.add_row("Health Endpoint", detection.infrastructure.health_endpoint or "/", expl.get("health_endpoint_reason", "-"))
+    console.print(tbl)
+
+
+@app.command("events")
+@handle_cli_exceptions
+def events(
+    project: str = typer.Argument(..., help="Project name"),
+    limit: Optional[int] = typer.Option(None, "--limit", "-n", help="Limit number of events displayed"),
+    json_output: bool = typer.Option(False, "--json", help="Output timeline in JSON format"),
+):
+    """
+    Display deployment lifecycle events and timeline for a project.
+    """
+    from deployx.deployment.project import show_project_timeline
+    show_project_timeline(project, limit=limit, json_format=json_output, console=console)
+
+
+@app.command("inspect")
+@handle_cli_exceptions
+def inspect(
+    project: str = typer.Argument(..., help="Project name"),
+    json_output: bool = typer.Option(False, "--json", help="Output inspection in JSON format"),
+):
+    """
+    Deep inspection of project configuration, state, environment, and containers.
+    """
+    from deployx.deployment.project import show_project_inspect
+    show_project_inspect(project, json_format=json_output, console=console)
+
+
+@app.command("cleanup")
+@handle_cli_exceptions
+def cleanup(
+    orphans: bool = typer.Option(False, "--orphans", help="Prune orphan containers and unreferenced resources"),
+    volumes: bool = typer.Option(False, "--volumes", help="Prune unused and orphan Docker volumes"),
+    force: bool = typer.Option(False, "--force", "-f", help="Force cleanup without interactive prompt"),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Confirm cleanup"),
+):
+    """
+    Clean dangling Docker images, builder cache, and orphan project resources.
+    """
+    from deployx.cleanup import run_system_cleanup
+    run_system_cleanup(orphans=orphans, delete_volumes=volumes, force=(force or yes), console=console)
+
+
+@app.command("self-update")
+@handle_cli_exceptions
+def self_update(
+    check: bool = typer.Option(False, "--check", help="Check for available updates without applying"),
+    channel: str = typer.Option("stable", "--channel", help="Release channel (stable/beta)"),
+    force: bool = typer.Option(False, "--force", "-f", help="Force update even if on latest version"),
+):
+    """
+    Check for or install updates to DeployX itself.
+    """
+    from deployx.self_update import SelfUpdateManager
+    mgr = SelfUpdateManager(channel=channel)
+    if check:
+        has_update, latest_ver = mgr.check_for_update()
+        if has_update:
+            console.print(f"[bold green]Update available:[/bold green] {latest_ver} (current: {__version__})")
+        else:
+            console.print(f"[green]DeployX is up to date (version {__version__}).[/green]")
+    else:
+        success, msg = mgr.perform_update(force=force)
+        if success:
+            console.print(f"[bold green]Self-update successful:[/bold green] {msg}")
+        else:
+            console.print(f"[bold red]Self-update failed:[/bold red] {msg}")
+            raise typer.Exit(1)
+
+
+# ----------------------------------------------------------------------
+# Domain Commands
+# ----------------------------------------------------------------------
+@domain_app.command("add")
+@handle_cli_exceptions
+def domain_add(
+    project: str = typer.Argument(..., help="Project name"),
+    domain: str = typer.Argument(..., help="Domain name (e.g. app.example.com)"),
+):
+    """
+    Assign a domain name to a project and configure reverse proxy routing.
+    """
+    from deployx.deployment.project import load_project_config, save_project_config
+    from deployx.network.proxy import ProxyManager
+    cfg = load_project_config(project)
+    cfg.deployment.domain = domain
+    save_project_config(cfg)
+    proxy = ProxyManager()
+    proxy.add_or_update_route(project, domain, cfg.deployment.docker.port)
+    console.print(f"[bold green]Configured reverse proxy route for '{project}' -> https://{domain}[/bold green]")
+
+
+@domain_app.command("remove")
+@handle_cli_exceptions
+def domain_remove(
+    project: str = typer.Argument(..., help="Project name"),
+):
+    """
+    Remove domain name and reverse proxy routing for a project.
+    """
+    from deployx.deployment.project import load_project_config, save_project_config
+    from deployx.network.proxy import ProxyManager
+    cfg = load_project_config(project)
+    old_domain = cfg.deployment.domain
+    cfg.deployment.domain = None
+    save_project_config(cfg)
+    if old_domain:
+        proxy = ProxyManager()
+        proxy.remove_route(old_domain)
+    console.print(f"[bold green]Removed domain route for '{project}'.[/bold green]")
+
+
+# ----------------------------------------------------------------------
+# Config Commands (Global & Project)
+# ----------------------------------------------------------------------
+@config_app.command("show")
+@handle_cli_exceptions
+def config_show(json_output: bool = typer.Option(False, "--json", help="Output in JSON format")):
+    """
+    Display current global configuration (/etc/deployx/config.yml).
+    """
+    import json, yaml
+    from deployx.config import load_global_config
+    cfg = load_global_config()
+    if json_output:
+        console.print(json.dumps(cfg, indent=2))
+    else:
+        console.print(Panel(yaml.dump(cfg, sort_keys=False), title="Global Configuration", border_style="cyan"))
+
+
+@config_app.command("set")
+@handle_cli_exceptions
+def config_set(
+    key: str = typer.Argument(..., help="Config key path (e.g. network.python.selected_mirror)"),
+    value: str = typer.Argument(..., help="Value to set"),
+):
+    """
+    Set a value in global configuration.
+    """
+    from deployx.config import set_global_config_value
+    success = set_global_config_value(key, value)
+    if success:
+        console.print(f"[bold green]Set global config '{key}' = '{value}'[/bold green]")
+    else:
+        console.print(f"[bold red]Failed to set global config '{key}'[/bold red]")
+        raise typer.Exit(1)
+
+
+@config_app.command("unset")
+@handle_cli_exceptions
+def config_unset(
+    key: str = typer.Argument(..., help="Config key path to remove"),
+):
+    """
+    Unset a value from global configuration.
+    """
+    from deployx.config import unset_global_config_value
+    success = unset_global_config_value(key)
+    if success:
+        console.print(f"[bold green]Unset global config '{key}'[/bold green]")
+    else:
+        console.print(f"[bold red]Failed to unset global config '{key}'[/bold red]")
+        raise typer.Exit(1)
+
+
+@config_app.command("reset")
+@handle_cli_exceptions
+def config_reset(
+    force: bool = typer.Option(False, "--force", "-f", help="Force reset without confirmation prompt"),
+):
+    """
+    Reset global configuration to default template.
+    """
+    from deployx.config import reset_global_config
+    success = reset_global_config()
+    if success:
+        console.print("[bold green]Reset global configuration to default template.[/bold green]")
+    else:
+        console.print("[bold red]Failed to reset global configuration.[/bold red]")
+        raise typer.Exit(1)
+
+
+@project_config_app.command("show")
+@handle_cli_exceptions
+def project_config_show(
+    project: str = typer.Argument(..., help="Project name"),
+    json_output: bool = typer.Option(False, "--json", help="Output in JSON format"),
+):
+    """
+    Display configuration for a specific project.
+    """
+    import json, yaml
+    from deployx.deployment.project import load_project_raw
+    raw = load_project_raw(project)
+    if json_output:
+        console.print(json.dumps(raw, indent=2))
+    else:
+        console.print(Panel(yaml.dump(raw, sort_keys=False), title=f"Config: {project}", border_style="cyan"))
+
+
+@project_config_app.command("set")
+@handle_cli_exceptions
+def project_config_set(
+    project: str = typer.Argument(..., help="Project name"),
+    key: str = typer.Argument(..., help="Key path (e.g. deployment.build_timeout)"),
+    value: str = typer.Argument(..., help="Value to set"),
+):
+    """
+    Set a configuration property for a project.
+    """
+    from deployx.config import set_project_config_value
+    success = set_project_config_value(project, key, value)
+    if success:
+        console.print(f"[bold green]Updated '{project}' config '{key}' = '{value}'[/bold green]")
+    else:
+        console.print(f"[bold red]Failed to update config for '{project}'[/bold red]")
+        raise typer.Exit(1)
+
+
+@project_config_app.command("unset")
+@handle_cli_exceptions
+def project_config_unset(
+    project: str = typer.Argument(..., help="Project name"),
+    key: str = typer.Argument(..., help="Key path to unset"),
+):
+    """
+    Unset a configuration property for a project.
+    """
+    from deployx.config import unset_project_config_value
+    success = unset_project_config_value(project, key)
+    if success:
+        console.print(f"[bold green]Unset '{project}' config '{key}'[/bold green]")
+    else:
+        console.print(f"[bold red]Failed to unset config for '{project}'[/bold red]")
+        raise typer.Exit(1)
+
+
 @app.command("generate")
 @handle_cli_exceptions
 def generate(
@@ -490,10 +814,10 @@ def generate(
     from deployx.core.security import validate_project_name
     from deployx.deployment.project import load_project_config
     from deployx.detectors.registry import detect_repository
-    from deployx.generators.django import (
-        generate_compose_file,
-        generate_django_dockerfile,
-        is_deployx_generated_file,
+    from deployx.generators.django import is_deployx_generated_file
+    from deployx.generators.registry import (
+        generate_compose_for_project,
+        generate_dockerfile_for_project,
     )
     from deployx.state import get_state_manager
 
@@ -515,7 +839,7 @@ def generate(
         if df_path.is_file() and not is_deployx_generated_file(df_path):
             console.print(f"[yellow]Preserving user-owned Dockerfile at {df_path} (missing DeployX marker)[/yellow]")
         else:
-            generate_django_dockerfile(config, detection, df_path)
+            generate_dockerfile_for_project(config, detection, df_path)
             console.print(f"[green]Regenerated Dockerfile at {df_path}[/green]")
 
     # 2. Compose file
@@ -523,18 +847,21 @@ def generate(
     if compose_file.is_file() and not is_deployx_generated_file(compose_file):
         console.print(f"[yellow]Preserving user-owned Compose file at {compose_file} (missing DeployX marker)[/yellow]")
     else:
-        generate_compose_file(config, detection, image_tag, compose_file)
+        generate_compose_for_project(config, detection, image_tag, compose_file)
         console.print(f"[green]Regenerated Compose manifest at {compose_file}[/green]")
 
 
 @app.command("status")
 @handle_cli_exceptions
-def status(project: str = typer.Argument(..., help="Project name")):
+def status(
+    project: str = typer.Argument(..., help="Project name"),
+    json_output: bool = typer.Option(False, "--json", help="Output in JSON format"),
+):
     """
     Check container and healthcheck status for a project.
     """
     from deployx.deployment.health import check_project_status
-    check_project_status(project, console=console)
+    check_project_status(project, console=console, json_format=json_output)
 
 
 @app.command("logs")

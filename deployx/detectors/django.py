@@ -165,13 +165,71 @@ class DjangoDetector(BaseDetector):
                 env_example_path = env_candidate
                 break
 
-        # Check specific dependencies
+        # Import shared detection helpers
+        from deployx.detectors.base import (
+            analyze_env_contract,
+            detect_health_endpoint,
+            detect_package_manager,
+            detect_python_version,
+        )
+
+        # Detect Python version & package manager
+        py_ver, py_constraint, py_reason = detect_python_version(repo_path)
+        pkg_mgr, install_cmd, pkg_reason = detect_package_manager(repo_path)
+        health_ep, health_reason = detect_health_endpoint(repo_path)
+        env_contract = analyze_env_contract(repo_path)
+
+        # Check workers & scheduler
+        has_celery_file = any(
+            not any(p.startswith(".") or p in {"venv", ".venv", "env"} for p in f.parts)
+            for f in repo_path.glob("**/celery.py")
+        )
+        has_celery = bool({"celery", "django-celery-beat", "django-celery-results"} & deps) or has_celery_file
+        has_rq = bool({"django-rq", "rq"} & deps)
+        has_beat = bool({"django-celery-beat"} & deps)
+        has_redis = bool({"redis", "django-redis", "redis-py"} & deps) or has_celery or has_rq
+        has_gunicorn = bool({"gunicorn", "uvicorn", "daphne", "granian", "waitress"} & deps)
+
+        # Check database preference & reason
         has_postgres = bool(
             {"psycopg2", "psycopg2-binary", "psycopg", "asyncpg", "dj-database-url"} & deps
         )
-        has_redis = bool({"redis", "django-redis", "redis-py"} & deps)
-        has_celery = bool({"celery", "django-celery-beat", "django-celery-results"} & deps)
-        has_gunicorn = bool({"gunicorn", "uvicorn", "daphne", "granian", "waitress"} & deps)
+        has_mysql = bool({"mysqlclient", "pymysql"} & deps)
+
+        db_type = "postgres"
+        db_reason = "Default production database"
+        if has_postgres:
+            db_type = "postgres"
+            db_reason = "PostgreSQL drivers (psycopg/dj-database-url) detected in project dependencies"
+        elif has_mysql:
+            db_type = "mysql"
+            db_reason = "MySQL drivers detected in project dependencies"
+        else:
+            # Check settings content
+            for sf in repo_path.glob("**/settings*.py"):
+                try:
+                    s_content = sf.read_text(encoding="utf-8", errors="ignore")
+                    if "django.db.backends.postgresql" in s_content:
+                        db_type = "postgres"
+                        db_reason = f"django.db.backends.postgresql configured in {sf.name}"
+                        has_postgres = True
+                        break
+                    elif "django.db.backends.sqlite3" in s_content and not has_postgres:
+                        db_type = "sqlite"
+                        db_reason = f"django.db.backends.sqlite3 configured in {sf.name}"
+                except Exception:
+                    pass
+
+        # Media directory detection
+        has_media = (repo_path / "media").is_dir()
+        if not has_media:
+            for sf in repo_path.glob("**/settings*.py"):
+                try:
+                    if "MEDIA_ROOT" in sf.read_text(encoding="utf-8", errors="ignore"):
+                        has_media = True
+                        break
+                except Exception:
+                    pass
 
         infra = DetectedInfrastructure(
             has_dockerfile=dockerfile_path is not None,
@@ -180,14 +238,36 @@ class DjangoDetector(BaseDetector):
             compose_path=compose_path,
             has_env_example=env_example_path is not None,
             env_example_path=env_example_path,
-            has_postgres=has_postgres,
+            has_postgres=has_postgres or (db_type == "postgres"),
             has_redis=has_redis,
             has_celery=has_celery,
+            has_rq=has_rq,
+            has_beat=has_beat,
+            has_media=has_media,
             has_gunicorn=has_gunicorn,
             dependencies=sorted(list(deps)),
             wsgi_module=wsgi_mod,
             settings_module=settings_mod,
+            python_version_req=py_constraint,
+            selected_python_version=py_ver,
+            package_manager=pkg_mgr,
+            install_command=install_cmd,
+            database=db_type,
+            database_reason=db_reason,
+            health_endpoint=health_ep,
+            env_contract=env_contract,
         )
+
+        explanation = {
+            "framework": f"Django detected based on {', '.join(indicators)}",
+            "runtime": py_reason,
+            "package_manager": pkg_reason,
+            "database": db_reason,
+            "redis": "Redis required for Celery/caching" if has_redis else "Redis not required",
+            "workers": f"Background worker ({'Celery' if has_celery else 'RQ'}) detected" if (has_celery or has_rq) else "No background workers required",
+            "health": health_reason,
+            "media": "Persistent media volume enabled (MEDIA_ROOT/media directory detected)" if has_media else "No persistent media volume required",
+        }
 
         return DetectionResult(
             framework=self.framework,
@@ -198,4 +278,5 @@ class DjangoDetector(BaseDetector):
                 "has_manage_py": manage_py.is_file(),
                 "manage_py_path": str(manage_py.relative_to(repo_path)) if manage_py.is_file() else None,
             },
+            explanation=explanation,
         )

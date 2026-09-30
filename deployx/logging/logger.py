@@ -69,6 +69,12 @@ class ProjectLogger:
     def warn(self, msg: str) -> None:
         self.log(msg, level="WARN")
 
+    def warning(self, msg: str) -> None:
+        self.log(msg, level="WARN")
+
+    def debug(self, msg: str) -> None:
+        self.log(msg, level="DEBUG")
+
     def error(self, msg: str) -> None:
         self.log(msg, level="ERROR")
 

@@ -5,6 +5,46 @@ All notable changes to DeployX are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0] - 2026-09-30
+
+### Added
+- **Zero-Touch Autonomous Deployment**:
+  - Direct repository URL deployment via `deployx deploy <git-url>`: Automatically resolves project name, verifies repository accessibility, detects remote default branch (`main`, `master`, etc.), classifies framework, allocates free ports, builds, configures, and deploys without manual configuration files.
+  - Interactive or non-interactive zero-touch registration via `resolve_or_register_project`.
+- **Multi-Framework & Deep Application Detection**:
+  - Detection and stack generators for **FastAPI** (`main:app`, Uvicorn, asyncpg, docs healthcheck), **Flask** (`app:app`, Gunicorn, SQLite/PostgreSQL), **Django**, and **Generic Python** applications (WSGI/ASGI/custom entrypoint).
+  - Python runtime version detector inspecting PEP 621 `[project] requires-python`, `[tool.poetry.dependencies]`, `runtime.txt`, and `.python-version` with support for bounded ranges (e.g. `<3.13` -> `3.12-slim`).
+  - Package manager detector supporting `uv` (`uv.lock`), Poetry (`poetry.lock`), and pip (`requirements.txt`).
+  - Environment contract detector parsing `.env.example`, `.env.template`, settings files, and source code for required secrets with masked interactive prompting and CLI `--env-secret KEY=VALUE`.
+- **Dynamic Port Conflict Auto-Resolution**:
+  - Verifies port availability against both active host sockets (`0.0.0.0`) and registered DeployX projects. Automatically selects the next available port upon conflict and persists the assignment.
+- **Intelligent PyPI Mirror Probing & Automatic Build Failover**:
+  - Active mirror latency probing (`test_mirror`) and dynamic ranking (`auto_select_best_mirror`).
+  - `MirrorFailoverManager`: Detects network and timeout errors during Docker builds and automatically retries with secondary/tertiary PyPI mirrors without operator intervention.
+- **Preflight Inspection Modes (`--dry-run` & `explain`)**:
+  - `deployx deploy <target> --dry-run`: Runs full repository sync, framework detection, and config generation without executing Docker commands or modifying system state.
+  - `deployx explain <project>`: Detailed terminal breakdown explaining framework detection confidence, indicators, Python version derivation, entrypoint, database choice, and proposed compose configuration.
+- **Reverse Proxy & Automatic HTTPS Engine (Caddy)**:
+  - Out-of-the-box reverse proxy orchestration via `deployx domain add <project> <domain>` and `deployx domain remove <project>`.
+  - DNS resolution pre-flight check before configuring TLS certificates.
+  - Reverse proxy configurations isolated under `/opt/deployx/proxy/sites/`.
+- **Automated Rollback on Health Check Failure**:
+  - Added `--auto-rollback` CLI flag and `deployment.auto_rollback` setting. Automatically reverts to previous known-good image and Git commit if post-deployment health check fails.
+- **Deployment Timeline & Deep Inspection**:
+  - `deployx events <project> [--json]`: Chronological event log of deployment stages (`preflight`, `docker_build`, `compose_up`, `migrations`, `healthcheck`, `rollback`) with timing and status.
+  - `deployx inspect <project> [--json]`: Comprehensive diagnostics payload including metadata, configuration, runtime deployment state, container inspect status, environment contract, and domain routing.
+  - Added `--json` support across `status`, `project list`, `project info`, and `events`.
+- **Global & Project Configuration CLI**:
+  - `deployx config show`, `deployx config set <key> <val>`, `deployx config unset <key>`, and `deployx config reset`.
+  - `deployx project config show <proj>`, `deployx project config set <proj> <key> <val>`, and `deployx project config unset <proj> <key>`.
+- **Initialization Wizard & System Cleanup**:
+  - `deployx init [--non-interactive]`: Pre-provisions directories, runs mirror latency benchmarks, and configures global settings.
+  - `deployx cleanup [--orphans] [--volumes] [--force]`: Prunes orphaned DeployX containers, builder cache, dangling images, and unreferenced project volumes.
+- **Autonomous Self-Update Engine**:
+  - `deployx self-update [--check] [--channel stable|beta] [--force]`: Queries GitHub Releases API, checks semantic versioning, and performs self-updates.
+
+---
+
 ## [0.1.6] - 2026-09-30
 
 ### Added

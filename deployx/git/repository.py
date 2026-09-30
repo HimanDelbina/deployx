@@ -142,3 +142,75 @@ class GitRepositoryManager:
             return res.stdout.strip()
         except Exception:
             return ""
+
+
+def detect_remote_default_branch(
+    repo_url: str,
+    env: Optional[Dict[str, str]] = None,
+    timeout: int = 30,
+) -> Optional[str]:
+    """
+    Inspects remote repository HEAD to automatically discover the default branch (e.g. master, main, trunk).
+    Uses 'git ls-remote --symref <repo> HEAD' or heads inspection.
+    """
+    import re
+
+    # 1. Try git ls-remote --symref <repo_url> HEAD
+    try:
+        res = run_command(
+            ["git", "ls-remote", "--symref", repo_url, "HEAD"],
+            env=env,
+            timeout=timeout,
+            check=False,
+        )
+        if res.returncode == 0:
+            for line in res.stdout.splitlines():
+                # Matches: ref: refs/heads/master\tHEAD
+                m = re.search(r"ref:\s*refs/heads/(\S+)\s+HEAD", line)
+                if m:
+                    return m.group(1).strip()
+    except Exception:
+        pass
+
+    # 2. Try git ls-remote --heads <repo_url>
+    branches = get_remote_branches(repo_url, env=env, timeout=timeout)
+    if not branches:
+        return None
+
+    # Priority check
+    for preferred in ["main", "master", "trunk", "production"]:
+        if preferred in branches:
+            return preferred
+
+    return branches[0]
+
+
+def get_remote_branches(
+    repo_url: str,
+    env: Optional[Dict[str, str]] = None,
+    timeout: int = 30,
+) -> List[str]:
+    """
+    Queries all available branches on the remote repository.
+    """
+    try:
+        res = run_command(
+            ["git", "ls-remote", "--heads", repo_url],
+            env=env,
+            timeout=timeout,
+            check=False,
+        )
+        if res.returncode != 0:
+            return []
+
+        branches: List[str] = []
+        for line in res.stdout.splitlines():
+            parts = line.strip().split()
+            if len(parts) >= 2 and parts[1].startswith("refs/heads/"):
+                branch_name = parts[1].removeprefix("refs/heads/").strip()
+                if branch_name:
+                    branches.append(branch_name)
+        return branches
+    except Exception:
+        return []
+

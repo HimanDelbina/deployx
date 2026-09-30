@@ -137,7 +137,7 @@ def perform_http_healthcheck(
     return False
 
 
-def check_project_status(project: str, console: Console) -> None:
+def check_project_status(project: str, console: Console, json_format: bool = False) -> None:
     """
     Displays current deployment state and active container processes for a project.
     """
@@ -145,6 +145,20 @@ def check_project_status(project: str, console: Console) -> None:
     cfg = load_project_config(valid_name)
     state_mgr = get_state_manager()
     state = state_mgr.get_state(valid_name)
+
+    if json_format:
+        import json
+        st_data = {
+            "project": valid_name,
+            "deployment_status": state.status.value if state else "none",
+            "health_status": state.health_status.value if state else "unknown",
+            "deployed_commit": state.current_commit if state else None,
+            "docker_image": state.docker_image if state else None,
+            "deployed_at": state.deployed_at if state else None,
+            "last_error": state.last_error if state else None,
+        }
+        console.print(json.dumps(st_data, indent=2))
+        return
 
     console.print(f"\n[bold cyan]DeployX Status: {valid_name}[/bold cyan]")
 

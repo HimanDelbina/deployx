@@ -574,21 +574,13 @@ def run_doctor(
     console: Console,
     check_network: bool = False,
     orphans: bool = False,
+    json_format: bool = False,
 ) -> bool:
     """
-    Executes doctor diagnostic checks and prints a formatted Rich report.
+    Executes doctor diagnostic checks and prints a formatted Rich report or JSON.
     Returns True if no ERROR checks were encountered, False otherwise.
     """
-    console.print("\n[bold cyan]DeployX Doctor Diagnostic Suite[/bold cyan]")
-    console.print("[dim]Scanning host environment and dependencies...[/dim]\n")
-
     items = collect_doctor_checks(check_network=check_network, orphans=orphans)
-
-    table = Table(show_header=True, header_style="bold magenta", expand=True)
-    table.add_column("Category", style="cyan", width=12)
-    table.add_column("Check", style="bold", width=26)
-    table.add_column("Status", width=12)
-    table.add_column("Details", style="white")
 
     ok_count = 0
     warn_count = 0
@@ -597,18 +589,53 @@ def run_doctor(
 
     for item in items:
         if item.status == CheckStatus.OK:
-            status_text = "[bold green][ OK ][/bold green]"
             ok_count += 1
         elif item.status == CheckStatus.WARNING:
-            status_text = "[bold yellow][ WARN ][/bold yellow]"
             warn_count += 1
             if item.recommendation:
                 recommendations.append(item)
         else:
-            status_text = "[bold red][ ERROR ][/bold red]"
             err_count += 1
             if item.recommendation:
                 recommendations.append(item)
+
+    if json_format:
+        import json
+        doc_data = {
+            "checks": [
+                {
+                    "category": it.category,
+                    "name": it.name,
+                    "status": it.status.value,
+                    "details": it.details,
+                    "recommendation": it.recommendation,
+                }
+                for it in items
+            ],
+            "passed": err_count == 0,
+            "ok_count": ok_count,
+            "warn_count": warn_count,
+            "err_count": err_count,
+        }
+        console.print(json.dumps(doc_data, indent=2))
+        return err_count == 0
+
+    console.print("\n[bold cyan]DeployX Doctor Diagnostic Suite[/bold cyan]")
+    console.print("[dim]Scanning host environment and dependencies...[/dim]\n")
+
+    table = Table(show_header=True, header_style="bold magenta", expand=True)
+    table.add_column("Category", style="cyan", width=12)
+    table.add_column("Check", style="bold", width=26)
+    table.add_column("Status", width=12)
+    table.add_column("Details", style="white")
+
+    for item in items:
+        if item.status == CheckStatus.OK:
+            status_text = "[bold green][ OK ][/bold green]"
+        elif item.status == CheckStatus.WARNING:
+            status_text = "[bold yellow][ WARN ][/bold yellow]"
+        else:
+            status_text = "[bold red][ ERROR ][/bold red]"
 
         table.add_row(item.category, item.name, status_text, item.details)
 

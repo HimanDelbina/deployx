@@ -10,6 +10,9 @@ from typing import List
 
 from deployx.detectors.base import BaseDetector, DetectionResult
 from deployx.detectors.django import DjangoDetector
+from deployx.detectors.fastapi import FastAPIDetector
+from deployx.detectors.flask import FlaskDetector
+from deployx.detectors.generic_python import GenericPythonDetector
 
 
 class DetectorRegistry:
@@ -46,6 +49,9 @@ class DetectorRegistry:
 # Global registry with default detectors
 registry = DetectorRegistry()
 registry.register(DjangoDetector())
+registry.register(FastAPIDetector())
+registry.register(FlaskDetector())
+registry.register(GenericPythonDetector())
 
 
 def detect_repository(repo_path: Path) -> DetectionResult:

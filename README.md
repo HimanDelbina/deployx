@@ -1,23 +1,23 @@
-# DeployX (v0.1.6)
+# DeployX (v0.2.0) — Zero-Touch Deployment
 
 > **Production-Grade Autonomous Deployment Manager for Ubuntu Linux servers (22.04 / 24.04 LTS).**  
-> Effortlessly register, verify, deploy, and incrementally update public and private GitHub projects using Docker and Docker Compose v2 with zero host bloat.
+> Effortlessly deploy, monitor, update, and rollback public and private GitHub projects with zero host bloat. DeployX automatically inspects your repository, detects frameworks (FastAPI, Flask, Django, Generic Python), selects Python runtimes, configures Docker and databases, resolves port conflicts, and manages reverse proxy routing with zero manual configuration.
 
 ---
 
 ## 🚀 Key Highlights & Philosophy
 
-- **Production-Ready & Hardened**: Engineered specifically for bare-metal / VPS Ubuntu Linux. Officially validated on **Ubuntu 22.04 LTS** and **24.04 LTS**, with automated compatibility mode for newer releases (such as Ubuntu 26.04).
-- **Zero Host Python Dependencies**: Application dependencies run exclusively inside isolated Docker containers. No pollution of host system packages.
-- **Strict Registration Validation**: Prevents invalid configurations upfront. Detects and rejects placeholder URLs (e.g. `REAL_REPOSITORY`, `USER`, `example.com`), verifies public repositories before saving, and enforces deploy key verification before private deployments.
-- **SSH Deploy Keys per Project**: Cryptographically generated ED25519 deploy keys stored with strict `0600` permissions. Existing keys are protected from accidental overwrite unless `--force` is specified. Never exposes or logs private keys.
-- **Safe Lifecycle Management**: Supports non-destructive project removal (`deployx project remove`) with optional `--purge`, configuration edits (`deployx project edit`), and non-interactive scripting (`--non-interactive`).
-- **Network & Mirror Friendly**: Fully supports custom package mirrors via `PIP_INDEX_URL`, includes preflight network diagnostics, preserves system DNS configurations untouched, and avoids forced pip upgrades.
-- **Existing Configuration Protection**: Respects and validates existing repository `Dockerfile`, `docker-compose.yml`, and `.env.example`. DeployX writes non-intrusive auxiliary files (e.g. `docker-compose.deployx.yml`) so your Git tree is never dirtied or overwritten.
-- **Zero Insecure Defaults**: High-entropy cryptographic secrets generated automatically using Python's `secrets` module (`SECRET_KEY`, `POSTGRES_PASSWORD`).
-- **Strict Version Tracking**: Docker images are automatically tagged with Git commit SHAs (`myproject:4ba128c`), laying the foundation for instant rollbacks and deterministic state reproduction.
-- **Automated Update Intelligence**: `deployx update` inspects remote repository HEADs before building, preventing unnecessary rebuilds if the codebase is already up to date.
-- **Robust Security Perimeter**: All subprocesses run with `shell=False`, strict argument arrays, regex-enforced project and URL sanitization, path traversal prevention, and automated secret redaction across all logs.
+- **Zero-Touch Autonomous Deployment**: Run `deployx deploy <git-url>` directly. DeployX automatically infers project name, verifies access, detects default branch (`main`/`master`), classifies framework, resolves port conflicts, configures Docker Compose, and provisions services without editing YAML files.
+- **Deep Application Detection**: Out-of-the-box detection and containerization for **FastAPI**, **Flask**, **Django**, and **Generic Python** (WSGI/ASGI/entrypoints).
+- **Smart Runtime & Dependency Resolution**: Automatically detects Python versions from PEP 621, `pyproject.toml`, `runtime.txt`, or `.python-version`, and supports `uv`, `poetry`, and standard `pip`.
+- **Dynamic Port Conflict Auto-Resolution**: Proactively scans host network interfaces and registered DeployX applications; shifts conflicting ports automatically (`8000 -> 8001 -> ...`).
+- **Resilient PyPI Mirror Failover**: Actively tests latency to global and regional PyPI mirrors, automatically retrying Docker builds on failover mirrors if timeouts or connection errors occur.
+- **Preflight Inspection & Explain Modes**: `--dry-run` validates configurations without mutating the system; `deployx explain <project>` visualizes detection rationale, entrypoint, database, and generated compose services.
+- **Managed Reverse Proxy & Automatic HTTPS (Caddy)**: Built-in `deployx domain add <project> <domain>` with DNS resolution checks and automated TLS certificates.
+- **Automated Rollback & Audit Timeline**: `--auto-rollback` reverts to previous known-good commit upon health check failure; `deployx events <project>` and `deployx inspect <project>` provide full visibility into deployment lifecycle.
+- **Zero Host Python Dependencies**: Application code and dependencies run exclusively inside isolated Docker containers. No pollution of host system packages.
+- **SSH Deploy Keys per Project**: Cryptographically generated ED25519 deploy keys stored with strict `0600` permissions.
+- **System Cleanup & Self-Update**: `deployx cleanup` removes unreferenced DeployX resources; `deployx self-update` keeps DeployX up to date.
 
 ---
 
@@ -128,7 +128,34 @@ Outputs clear `[ OK ]`, `[ WARN ]`, and `[ ERROR ]` badges alongside actionable 
 
 ## 📖 Quickstart Guide
 
-### 1. Deploying a Public GitHub Repository
+### 0. Zero-Touch One-Command Deployment (Recommended)
+
+Deploy a supported application directly from its Git URL in a single command:
+
+```bash
+# Public repository
+deployx deploy https://github.com/myorg/my-fastapi-app.git
+
+# Or with custom domain, automated rollback, and preflight dry-run:
+deployx deploy https://github.com/myorg/my-fastapi-app.git \
+  --domain api.example.com \
+  --auto-rollback \
+  --dry-run
+```
+
+**What DeployX does autonomously:**
+1. **Repository & Branch Intelligence**: Extracts project name (`my-fastapi-app`), checks connectivity, and queries remote `HEAD` for default branch (`main`/`master`).
+2. **Deep Application Detection**: Identifies whether the project is **FastAPI**, **Flask**, **Django**, or **Generic Python**; derives the entrypoint and database backend.
+3. **Smart Runtime Selection**: Detects Python version constraints from PEP 621, `pyproject.toml`, or `.python-version` (e.g. `<3.13` -> Python 3.12-slim).
+4. **Package Manager Detection**: Automatically configures `uv`, Poetry, or pip based on project lockfiles.
+5. **Environment Contract**: Parses required secrets from `.env.example`, `.env.template`, or settings files, securely prompting with masked input or honoring `--env-secret KEY=VALUE`.
+6. **Dynamic Port Conflict Resolution**: Automatically scans host ports; if `8000` is occupied, assigns `8001`, `8002`, etc., avoiding port collisions.
+7. **Resilient Mirror Failover**: Probes PyPI mirrors; if network errors occur during Docker build, retries automatically with failover mirrors.
+8. **Automated Rollback**: If `--auto-rollback` is specified and health checks fail, safely restores previous known-good containers and images.
+
+---
+
+### 1. Deploying a Public GitHub Repository (Two-Step Flow)
 
 DeployX automatically detects placeholders, checks remote connectivity via `git ls-remote`, and verifies that the specified branch exists before saving the project.
 
@@ -327,27 +354,34 @@ deployx update my-django-app
 
 | Command | Purpose |
 | :--- | :--- |
+| `deployx deploy <url\|project>` | Deploys directly via Git URL or project name (supports `--dry-run`, `--explain`, `--auto-rollback`, `--domain`) |
+| `deployx explain <project>` | Explains framework detection confidence, entrypoint, runtime, and proposed compose configuration |
+| `deployx events <project>` | Displays deployment timeline audit trail with stage durations and status (`--json`) |
+| `deployx inspect <project>` | Displays comprehensive diagnostic payload across state, containers, and config (`--json`) |
+| `deployx update <project>` | Performs zero-drift, SHA-checked incremental update (supports `--build-timeout`, `--auto-rollback`) |
+| `deployx rollback <project>` | Safely rolls back project to previously deployed commit and Docker image |
+| `deployx status <project>` | Inspects live container statuses and healthcheck state (`--json`) |
+| `deployx logs <project>` | Views streaming or tailed Docker container logs (`--tail 100`, `--follow`) |
+| `deployx domain add <p> <dom>` | Configures reverse proxy routing and automated HTTPS via Caddy |
+| `deployx domain remove <p>` | Removes reverse proxy route for a project |
+| `deployx config <cmd>` | Global configuration manager (`show`, `set`, `unset`, `reset`) |
+| `deployx project config <cmd>` | Per-project configuration manager (`show`, `set`, `unset`) |
 | `deployx project add` | Registers a new project with placeholder detection & verification |
-| `deployx project list` | Lists all registered projects with branch, commit, and verification status |
-| `deployx project info <project>` | Displays complete project metadata, paths, and deployment state |
+| `deployx project list` | Lists all registered projects with branch, commit, and verification status (`--json`) |
+| `deployx project info <project>` | Displays complete project metadata, paths, and deployment state (`--json`) |
 | `deployx project edit <project>` | Safely updates project configuration parameters with re-validation |
 | `deployx project rename <old> <new>` | Safely renames an undeployed project across filesystem and keys |
-| `deployx project remove <project>` | Removes project metadata safely; supports `--purge` and `--delete-volumes` |
+| `deployx project remove <project>` | Removes project metadata safely; supports `--purge` and `--remove-volumes` |
 | `deployx key create <project>` | Generates dedicated ED25519 deploy key (preserves existing unless `--force`) |
 | `deployx key show <project>` | Displays public SSH deploy key |
 | `deployx key verify <project>` | Tests SSH authentication against remote repository & verifies branch |
 | `deployx key remove <project>` | Explicitly removes SSH deploy key pair with confirmation |
-| `deployx deploy <project>` | Builds, provisions, and deploys the project (supports `--build-timeout`, `--regenerate`) |
-| `deployx update <project>` | Performs zero-drift, SHA-checked incremental update (supports `--build-timeout`) |
-| `deployx rollback <project>` | Safely rolls back project to previously deployed commit and Docker image |
 | `deployx generate <project>` | Safely regenerates DeployX-owned files (`Dockerfile.deployx`, compose manifest) |
-| `deployx status <project>` | Inspects live container statuses and healthcheck state |
-| `deployx logs <project>` | Views streaming or tailed Docker container logs (`--tail 100`, `--follow`) |
-| `deployx restart <project>` | Restarts project containers safely |
-| `deployx stop <project>` | Stops running containers |
-| `deployx start <project>` | Starts stopped containers |
+| `deployx init` | System initialization wizard (configures directories, mirrors, proxy defaults) |
+| `deployx cleanup` | Cleans orphaned DeployX containers, builder cache, dangling images, and unused volumes |
 | `deployx doctor` | Runs full system, Docker, permission, and network diagnostics (`--orphans`, `--docker-network`) |
 | `deployx project doctor <project>` | Runs targeted container, volume, network, and database checks for a project |
+| `deployx self-update` | Checks for and executes autonomous in-place updates from GitHub releases |
 
 ---
 

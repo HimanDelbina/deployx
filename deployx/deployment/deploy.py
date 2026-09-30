@@ -4,35 +4,43 @@ Executes complete 12-stage automated deployment workflow:
 Preflight -> Sync Git -> Commit Resolve -> Detect Framework -> Validate/Generate Config ->
 Build Docker Image -> Spin up Infra (DB/Redis) -> In-container Migrations ->
 In-container Collectstatic -> Start Application -> Health Check -> Persist State.
+Includes zero-touch URL deployment, port conflict resolution, secret prompting,
+PyPI mirror failover, dry-run, explain, and automatic rollback.
 """
 
 from __future__ import annotations
 
 import datetime
+import os
+import re
+import shutil
+import sys
+import time
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
+from urllib.parse import urlparse
 
 from rich.console import Console
 from rich.panel import Panel
+from rich.prompt import Confirm, Prompt
 from rich.table import Table
 
-import os
 from deployx.config import get_effective_build_timeout, paths
 from deployx.core.command import CommandError, run_command
 from deployx.core.exceptions import extract_root_exception
 from deployx.core.filesystem import ensure_directory
 from deployx.core.security import redact_url_credentials, validate_project_name
 from deployx.deployment.health import perform_http_healthcheck
-from deployx.deployment.project import load_project_config
+from deployx.deployment.project import load_project_config, save_project_config, project_exists
 from deployx.detectors.registry import detect_repository
 from deployx.docker.compose import DockerComposeManager, check_image_exists
-from deployx.generators.django import (
-    generate_compose_file,
-    generate_django_dockerfile,
-    is_deployx_generated_file,
+from deployx.generators.django import is_deployx_generated_file
+from deployx.generators.registry import (
+    generate_compose_for_project,
+    generate_dockerfile_for_project,
 )
-from deployx.generators.environment import generate_production_env
-from deployx.git.repository import GitRepositoryManager
+from deployx.generators.environment import generate_production_env, prompt_for_required_secrets
+from deployx.git.repository import GitRepositoryManager, detect_remote_default_branch
 from deployx.logging.logger import ProjectLogger
 from deployx.models import (
     DatabasePreference,
@@ -42,8 +50,103 @@ from deployx.models import (
     HealthStatus,
     ProjectConfig,
 )
+from deployx.network.mirrors import MirrorFailoverManager
+from deployx.network.ports import find_available_port, is_port_in_use
+from deployx.network.proxy import ProxyManager
 from deployx.state import get_state_manager
 from deployx.ui.progress import DeploymentProgressReporter
+
+
+def is_git_url(target: str) -> bool:
+    """Checks whether the target argument is a Git repository URL."""
+    cleaned = target.strip()
+    return (
+        cleaned.startswith("git@")
+        or cleaned.startswith("ssh://")
+        or cleaned.startswith("http://")
+        or cleaned.startswith("https://")
+        or cleaned.endswith(".git")
+    )
+
+
+def extract_project_name_from_url(repo_url: str) -> str:
+    """Extracts a valid normalized project name from a Git repository URL."""
+    cleaned = repo_url.strip()
+    if ":" in cleaned and not (cleaned.startswith("http://") or cleaned.startswith("https://") or cleaned.startswith("ssh://")):
+        path_part = cleaned.split(":")[-1]
+    else:
+        path_part = urlparse(cleaned).path
+
+    stem = Path(path_part).stem
+    if stem.endswith(".git"):
+        stem = stem[:-4]
+    name = re.sub(r"[^a-zA-Z0-9_\-]", "", stem).lower()
+    return name or "project"
+
+
+def resolve_or_register_project(
+    target: str,
+    console: Optional[Console] = None,
+    non_interactive: bool = False,
+    yes: bool = False,
+) -> str:
+    """
+    Resolves project name or auto-registers a project when given a Git repository URL.
+    """
+    if not is_git_url(target):
+        return validate_project_name(target)
+
+    proj_name = extract_project_name_from_url(target)
+    proj_name = validate_project_name(proj_name)
+
+    if not project_exists(proj_name):
+        if console:
+            console.print(
+                f"[bold cyan]Zero-Touch:[/bold cyan] Inferred project name '[bold green]{proj_name}[/bold green]' from repository URL."
+            )
+
+        is_private = target.startswith("git@") or target.startswith("ssh://")
+
+        try:
+            detected_branch = detect_remote_default_branch(target)
+        except Exception:
+            detected_branch = "main"
+
+        if console:
+            console.print(f"[dim]Discovered default branch: {detected_branch}[/dim]")
+
+        from deployx.deployment.project import add_project
+        add_project(
+            name=proj_name,
+            git=target,
+            branch=detected_branch,
+            private=is_private,
+            non_interactive=True,
+            console=console,
+        )
+
+        if is_private:
+            from deployx.git.ssh import create_deploy_key, show_deploy_key, verify_deploy_key
+            create_deploy_key(proj_name, console=console)
+            show_deploy_key(proj_name, console=console)
+            is_interactive = (
+                sys.stdin.isatty()
+                and "pytest" not in sys.modules
+                and not non_interactive
+                and not yes
+            )
+            if is_interactive:
+                Prompt.ask(
+                    "\n[bold yellow]Please add the public key above to GitHub (Repository -> Settings -> Deploy keys).\nOnce added, press Enter to verify connection[/bold yellow]"
+                )
+                verify_deploy_key(proj_name, console=console)
+            else:
+                if console:
+                    console.print(
+                        f"[yellow]Deploy key generated. Add to GitHub and verify with: deployx key verify {proj_name}[/yellow]"
+                    )
+
+    return proj_name
 
 
 def resolve_build_environment(config: ProjectConfig) -> dict[str, str]:
@@ -78,7 +181,6 @@ def resolve_build_environment(config: ProjectConfig) -> dict[str, str]:
 def check_package_index_reachability(index_url: str, timeout: float = 3.0) -> tuple[bool, str]:
     """
     Performs a lightweight reachability check from the host to a custom Python package index.
-    Non-blocking: failures emit diagnostics and warnings but do not abort deployment.
     """
     import urllib.error
     import urllib.request
@@ -105,12 +207,29 @@ def run_deployment(
     verbose: bool = False,
     plain: bool = False,
     regenerate: bool = False,
+    dry_run: bool = False,
+    explain: bool = False,
+    yes: bool = False,
+    non_interactive: bool = False,
+    domain: Optional[str] = None,
+    auto_rollback: Optional[bool] = None,
+    env_secrets: Optional[dict[str, str]] = None,
     console: Optional[Console] = None,
 ) -> bool:
     """
-    Executes the production deployment pipeline for a registered project.
+    Executes the production deployment pipeline for a registered project or Git URL.
     """
-    valid_name = validate_project_name(project_name)
+    if console is None:
+        console = Console()
+
+    # Step 0: Resolve project name (support Git URLs)
+    valid_name = resolve_or_register_project(
+        project_name,
+        console=console,
+        non_interactive=non_interactive,
+        yes=yes,
+    )
+
     logger = ProjectLogger(valid_name)
     state_mgr = get_state_manager()
     current_state = state_mgr.get_state(valid_name)
@@ -137,6 +256,31 @@ def run_deployment(
         reporter.start_stage(1, "Preflight checks & load configuration")
         try:
             config: ProjectConfig = load_project_config(valid_name)
+
+            # Domain override
+            if domain:
+                config.deployment.domain = domain
+                save_project_config(config)
+
+            # Env secrets override
+            if env_secrets:
+                if not config.deployment.env_secrets:
+                    config.deployment.env_secrets = {}
+                config.deployment.env_secrets.update(env_secrets)
+                save_project_config(config)
+
+            # Port conflict auto-resolution
+            preferred_port = config.deployment.docker.port
+            if is_port_in_use(preferred_port):
+                assigned_port = find_available_port(preferred_port=preferred_port, exclude_project=valid_name)
+                logger.info(f"Port {preferred_port} is in use; auto-switching to {assigned_port}.")
+                if console:
+                    console.print(
+                        f"[bold yellow]Notice: Host port {preferred_port} is busy. Automatically assigned available port {assigned_port}.[/bold yellow]"
+                    )
+                config.deployment.docker.port = assigned_port
+                save_project_config(config)
+
             build_env = resolve_build_environment(config)
             pip_idx = build_env.get("PIP_INDEX_URL")
             reporter.config = config
@@ -163,7 +307,13 @@ def run_deployment(
             logger.error(f"Configuration validation failed for '{valid_name}': {exc}")
             return False
 
-        # Preflight summary before first deployment (Requirement 36)
+        # Initialize state tracking & record preflight
+        now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        current_state = current_state or DeploymentState.new(valid_name, config.git.repository, config.git.branch)
+        current_state.record_event("preflight", "success", "Preflight checks passed")
+        state_mgr.save_state(current_state)
+
+        # Preflight summary before first deployment
         if console and (not current_state or not current_state.current_commit):
             preflight_tbl = Table(title=f"Preflight Summary: {valid_name}", show_header=False)
             preflight_tbl.add_column("Property", style="bold cyan")
@@ -180,8 +330,7 @@ def run_deployment(
             preflight_tbl.add_row("Deploy key", "ready" if (not config.git.private or getattr(config.git, "verified", False)) else "pending")
             console.print(preflight_tbl)
 
-        # Disk space check before build (Requirement 37)
-        import shutil
+        # Disk space check before build
         try:
             _, _, free_b = shutil.disk_usage(paths.root_dir)
             free_gb = free_b / (1024 ** 3)
@@ -239,6 +388,10 @@ def run_deployment(
         prev_commit = current_state.current_commit if current_state else None
         prev_image = current_state.docker_image if current_state else None
 
+        current_state.current_commit = resolved_commit
+        current_state.record_event("git_sync", "success", f"Repository synced to {short_commit}")
+        state_mgr.save_state(current_state)
+
         # Stage 3: Resolve commit & image version tagging
         image_tag = f"deployx_{valid_name}:{short_commit}"
         reporter.start_stage(3, f"Resolved commit: {short_commit} (Image: {image_tag})")
@@ -251,9 +404,98 @@ def run_deployment(
             f"Framework detected: {detection.framework.value} (confidence: {detection.confidence:.2f})"
         )
 
-        # Stage 5: Validate configuration & protect existing repo files
+        current_state.detected_framework = detection.framework.value
+        current_state.detected_python_version = detection.infrastructure.selected_python_version
+        current_state.detected_package_manager = detection.infrastructure.package_manager
+        current_state.detected_health_endpoint = detection.infrastructure.health_endpoint
+        state_mgr.save_state(current_state)
+
+        # Auto-detect framework update if user kept default and confidence is high
+        if (
+            config.deployment.framework == FrameworkType.DJANGO
+            and detection.framework in (FrameworkType.FASTAPI, FrameworkType.FLASK, FrameworkType.GENERIC_PYTHON)
+            and detection.confidence >= 0.8
+        ):
+            config.deployment.framework = detection.framework
+            save_project_config(config)
+            if console:
+                console.print(
+                    f"[dim cyan]Framework auto-detected: {detection.framework.value} ({detection.confidence:.0%})[/dim cyan]"
+                )
+
+        # Explain mode output
+        if explain:
+            expl_tbl = Table(title=f"Architectural Analysis: {valid_name}", show_header=True, header_style="bold magenta")
+            expl_tbl.add_column("Component", style="bold cyan")
+            expl_tbl.add_column("Decision")
+            expl_tbl.add_column("Rationale", style="white")
+
+            expl = detection.explanation
+            expl_tbl.add_row("Framework", detection.framework.value, expl.get("framework_reason", "-"))
+            expl_tbl.add_row("Python Version", detection.infrastructure.selected_python_version or "3.12", expl.get("python_version_reason", "-"))
+            expl_tbl.add_row("Package Manager", detection.infrastructure.package_manager or "pip", expl.get("package_manager_reason", "-"))
+            expl_tbl.add_row("Database", config.deployment.database.value, expl.get("database_reason", "-"))
+            expl_tbl.add_row("Workers", "enabled" if (config.deployment.celery or detection.infrastructure.has_celery) else "none", expl.get("workers_reason", "-"))
+            expl_tbl.add_row("Health Endpoint", detection.infrastructure.health_endpoint or "/", expl.get("health_endpoint_reason", "-"))
+
+            console.print(expl_tbl)
+
+        # Dry Run mode output
+        if dry_run:
+            dry_tbl = Table(title=f"Deployment Plan (Dry Run): {valid_name}", show_header=True, header_style="bold magenta")
+            dry_tbl.add_column("Property", style="bold cyan")
+            dry_tbl.add_column("Plan Value")
+
+            dry_tbl.add_row("Target Project", valid_name)
+            dry_tbl.add_row("Repository", config.git.repository)
+            dry_tbl.add_row("Branch / Commit", f"{config.git.branch} ({short_commit})")
+            dry_tbl.add_row("Framework", config.deployment.framework.value)
+            dry_tbl.add_row("Python Runtime", f"python:{detection.infrastructure.selected_python_version or '3.12'}-slim")
+            dry_tbl.add_row("Package Manager", detection.infrastructure.package_manager or "pip")
+            dry_tbl.add_row("External Port", str(config.deployment.docker.port))
+            dry_tbl.add_row("Health Endpoint", config.deployment.healthcheck.path)
+            dry_tbl.add_row("Database Service", "db (PostgreSQL 16)" if config.deployment.database == DatabasePreference.POSTGRES else "None")
+            dry_tbl.add_row("Redis Service", "redis (Redis 7)" if config.deployment.redis else "None")
+            dry_tbl.add_row("Auto-Rollback", "Enabled" if config.deployment.auto_rollback else "Disabled")
+            dry_tbl.add_row("Domain / SSL", config.deployment.domain or "None")
+
+            console.print(Panel(dry_tbl, title="Deployment Dry Run", border_style="cyan"))
+            console.print("[bold green]Dry run completed successfully. No changes made to live environment.[/bold green]")
+            return True
+
+        # Interactive Plan Preview before first deployment
+        is_interactive_plan = (
+            sys.stdin.isatty()
+            and "pytest" not in sys.modules
+            and not non_interactive
+            and not yes
+        )
+        if is_interactive_plan and (not current_state.deployed_at):
+            plan_preview = Table(title=f"Deployment Plan Preview: {valid_name}", show_header=False)
+            plan_preview.add_column("Property", style="bold cyan")
+            plan_preview.add_column("Value")
+            plan_preview.add_row("Framework", config.deployment.framework.value)
+            plan_preview.add_row("Python Version", detection.infrastructure.selected_python_version or "3.12")
+            plan_preview.add_row("Package Manager", detection.infrastructure.package_manager or "pip")
+            plan_preview.add_row("Port", str(config.deployment.docker.port))
+            plan_preview.add_row("Database", config.deployment.database.value)
+            console.print(plan_preview)
+            proceed = Confirm.ask("Proceed with deployment?", default=True)
+            if not proceed:
+                console.print("[yellow]Deployment aborted by user.[/yellow]")
+                return True
+
+        # Stage 5: Validate configuration & check env contract
         reporter.start_stage(5, "Validating deployment configuration")
         project_dir = paths.get_project_dir(valid_name)
+
+        if detection.infrastructure.env_contract:
+            prompt_for_required_secrets(
+                config,
+                detection.infrastructure.env_contract,
+                non_interactive=(non_interactive or yes),
+                console=console,
+            )
 
         # Stage 6: Generate missing deployment configurations
         reporter.start_stage(6, "Generating isolated deployment configurations")
@@ -275,36 +517,35 @@ def run_deployment(
             df_path = project_dir / "Dockerfile.deployx"
             if df_path.is_file():
                 if is_deployx_generated_file(df_path) or regenerate:
-                    generate_django_dockerfile(config, detection, df_path)
+                    generate_dockerfile_for_project(config, detection, df_path)
                     logger.info(f"Refreshed DeployX Dockerfile at {df_path}")
                 else:
                     logger.info(
                         f"Preserving user-owned Dockerfile at {df_path} (missing DeployX marker)"
                     )
             else:
-                generate_django_dockerfile(config, detection, df_path)
+                generate_dockerfile_for_project(config, detection, df_path)
                 logger.info(f"Generated Dockerfile at {df_path}")
 
         # 6c. Compose file (docker-compose.deployx.yml)
         compose_file = project_dir / "docker-compose.deployx.yml"
         if compose_file.is_file():
             if is_deployx_generated_file(compose_file) or regenerate:
-                generate_compose_file(config, detection, image_tag, compose_file)
+                generate_compose_for_project(config, detection, image_tag, compose_file)
                 logger.info(f"Refreshed DeployX Docker Compose manifest at {compose_file}")
             else:
                 logger.info(
                     f"Preserving user-owned Compose file at {compose_file} (missing DeployX marker)"
                 )
         else:
-            generate_compose_file(config, detection, image_tag, compose_file)
+            generate_compose_for_project(config, detection, image_tag, compose_file)
             logger.info(f"Generated Docker Compose v2 manifest at {compose_file}")
 
         compose_mgr = DockerComposeManager(valid_name, compose_file=compose_file)
 
-        # Stage 7: Docker build
+        # Stage 7: Docker build with PyPI Mirror Failover
         reporter.start_stage(7, f"Building Docker image ({image_tag})")
 
-        # Build cache awareness (Requirement 24)
         cache_found = check_image_exists(image_tag) or check_image_exists(f"deployx_{valid_name}:current")
         if cache_found:
             if console:
@@ -315,7 +556,6 @@ def run_deployment(
                 console.print("[dim cyan]Cold build: no reusable image cache detected[/dim cyan]")
             logger.info("Docker build cache: cold build (no reusable image cache detected)")
 
-        # Optional lightweight reachability check for custom package index
         if pip_idx:
             reachable, reason = check_package_index_reachability(pip_idx)
             safe_idx = redact_url_credentials(pip_idx)
@@ -325,22 +565,61 @@ def run_deployment(
                 logger.warning(
                     f"Host precheck warning: Custom package index '{safe_idx}' could not be reached from host: {reason}"
                 )
-                if console:
-                    console.print(
-                        f"[dim yellow]Notice: Host precheck could not reach '{safe_idx}' ({reason}). Proceeding with build...[/dim yellow]"
-                    )
 
-        logger.info(f"Executing: docker compose build web (timeout={effective_build_timeout})")
-        compose_mgr.build(
-            service="web",
-            stream=True,
-            on_line=reporter.on_build_output,
-            on_heartbeat=reporter.on_heartbeat,
-            on_stall=reporter.on_stall,
-            log_file=deploy_log_file,
-            env=build_env,
-            timeout=effective_build_timeout,
-        )
+        current_state.record_event("docker_build", "started", f"Building image {image_tag}")
+        state_mgr.save_state(current_state)
+
+        failover_mgr = MirrorFailoverManager(initial_mirror=pip_idx)
+        build_attempts = 0
+        max_attempts = 3
+
+        while True:
+            build_attempts += 1
+            try:
+                compose_mgr.build(
+                    service="web",
+                    stream=True,
+                    on_line=reporter.on_build_output,
+                    on_heartbeat=reporter.on_heartbeat,
+                    on_stall=reporter.on_stall,
+                    log_file=deploy_log_file,
+                    env=build_env,
+                    timeout=effective_build_timeout,
+                )
+                current_state.record_event("docker_build", "success", "Docker build completed successfully")
+                state_mgr.save_state(current_state)
+                break
+            except CommandError as b_err:
+                err_msg = b_err.message.lower()
+                is_mirror_err = any(
+                    err_term in err_msg
+                    for err_term in [
+                        "connection timed out",
+                        "readtimeouterror",
+                        "network is unreachable",
+                        "proxyerror",
+                        "could not find a version",
+                        "retrying",
+                        "certificate_verify_failed",
+                        "temporary failure in name resolution",
+                    ]
+                )
+                if is_mirror_err and failover_mgr.has_remaining_mirrors() and build_attempts < max_attempts:
+                    next_mirror = failover_mgr.get_next_fallback_mirror()
+                    if next_mirror:
+                        if console:
+                            console.print(
+                                f"[bold yellow]Docker build failed due to PyPI mirror network issue. Switching to failover mirror: {next_mirror}[/bold yellow]"
+                            )
+                        logger.warning(f"Docker build mirror error. Switching to fallback mirror: {next_mirror}")
+                        build_env["PIP_INDEX_URL"] = next_mirror
+                        p_host = urlparse(next_mirror).hostname
+                        if p_host and p_host != "pypi.org":
+                            build_env["PIP_TRUSTED_HOST"] = p_host
+                        current_state.record_event("docker_build", "retry", f"Retrying build with mirror {next_mirror}")
+                        state_mgr.save_state(current_state)
+                        continue
+                raise b_err
 
         # Stage 8: Spin up supporting infrastructure (PostgreSQL / Redis)
         infra_services = []
@@ -352,13 +631,14 @@ def run_deployment(
         infra_label = f"Starting infrastructure services ({', '.join(infra_services)})" if infra_services else "Checking infrastructure services"
         reporter.start_stage(8, infra_label)
         if infra_services:
+            current_state.record_event("infrastructure", "started", f"Starting infrastructure: {infra_services}")
+            state_mgr.save_state(current_state)
             logger.info(f"Starting infrastructure services: {infra_services}")
             compose_mgr.up(services=infra_services)
 
-            # Database readiness check for PostgreSQL (Requirement 42)
+            # Database readiness check for PostgreSQL
             if "db" in infra_services and config.deployment.database == DatabasePreference.POSTGRES:
                 logger.info("Waiting for PostgreSQL database readiness via pg_isready...")
-                import time
                 for _ in range(15):
                     try:
                         res_p = compose_mgr.run_transient("db", ["pg_isready"], timeout=5)
@@ -368,8 +648,10 @@ def run_deployment(
                     except Exception:
                         pass
                     time.sleep(1.5)
+            current_state.record_event("infrastructure", "success", "Infrastructure ready")
+            state_mgr.save_state(current_state)
 
-        # Runtime database backend preflight & safety checks (Requirements 5, 6, 8, 29, 47)
+        # Runtime database backend preflight & safety checks (Django)
         detected_runtime_db = None
         if config.deployment.framework == FrameworkType.DJANGO:
             logger.info("Validating Django runtime database backend and production settings...")
@@ -410,7 +692,6 @@ def run_deployment(
                     else:
                         detected_runtime_db = runtime_engine
 
-                    # Production Safety Check: DEBUG=True (Requirements 8, 47)
                     if probe_data.get("debug") is True:
                         msg_debug = (
                             "[bold yellow]WARNING: Django DEBUG=True is active in production.[/bold yellow]\n\n"
@@ -420,7 +701,6 @@ def run_deployment(
                         if console:
                             console.print(Panel(msg_debug, title="Production Safety Warning", border_style="yellow"))
 
-                    # Production Safety Check: ALLOWED_HOSTS
                     allowed = probe_data.get("allowed_hosts", [])
                     if not allowed and config.deployment.domain:
                         msg_hosts = f"[bold yellow]WARNING: Django ALLOWED_HOSTS is empty! Requests will return HTTP 400 Bad Request.[/bold yellow]"
@@ -433,7 +713,6 @@ def run_deployment(
                         if console:
                             console.print(msg_hosts)
 
-                    # Critical Check: Database Backend Mismatch (Requirements 5, 6)
                     if config.deployment.database == DatabasePreference.POSTGRES and "sqlite" in runtime_engine.lower():
                         err_mismatch = (
                             "Database backend mismatch\n\n"
@@ -464,47 +743,55 @@ def run_deployment(
             except Exception as pe:
                 logger.warn(f"Django preflight probe skipped: {pe}")
 
-        # Stage 9: Execute database migrations inside container (Requirements 7, 43)
+        # Stage 9: Execute database migrations inside container
         reporter.start_stage(9, "Running database migrations in container")
-        logger.info("Executing migrations: python manage.py migrate --noinput")
-        try:
-            compose_mgr.run_transient(
-                "web",
-                ["python", "manage.py", "migrate", "--noinput"],
-                stream=True,
-                on_line=reporter.on_build_output,
-                log_file=deploy_log_file,
-            )
-            # Verify migrations applied (Requirement 7)
+        if config.deployment.framework == FrameworkType.DJANGO:
+            logger.info("Executing migrations: python manage.py migrate --noinput")
             try:
-                res_v = compose_mgr.run_transient("web", ["python", "manage.py", "showmigrations", "--plan"], timeout=30)
-                if res_v.success:
-                    logger.info("Migration plan verified successfully.")
-            except Exception as ver_exc:
-                logger.warn(f"Migration verification check notice: {ver_exc}")
-        except CommandError as mig_exc:
-            logger.warn(f"Migration command warning or non-critical skip: {mig_exc.message}")
+                compose_mgr.run_transient(
+                    "web",
+                    ["python", "manage.py", "migrate", "--noinput"],
+                    stream=True,
+                    on_line=reporter.on_build_output,
+                    log_file=deploy_log_file,
+                )
+                current_state.record_event("migrations", "success", "Database migrations executed")
+                state_mgr.save_state(current_state)
+            except CommandError as mig_exc:
+                logger.warn(f"Migration command warning or non-critical skip: {mig_exc.message}")
+        else:
+            # Check for Alembic in FastAPI/Flask
+            if (repo_mgr.repo_dir / "alembic.ini").is_file():
+                try:
+                    compose_mgr.run_transient("web", ["alembic", "upgrade", "head"], stream=True, log_file=deploy_log_file)
+                    current_state.record_event("migrations", "success", "Alembic migrations executed")
+                    state_mgr.save_state(current_state)
+                except Exception as alembic_exc:
+                    logger.warn(f"Alembic migration notice: {alembic_exc}")
 
-        # Stage 10: Collect static files inside container (Requirement 43)
+        # Stage 10: Collect static files inside container
         reporter.start_stage(10, "Collecting static files in container")
-        logger.info("Executing collectstatic: python manage.py collectstatic --noinput")
-        try:
-            compose_mgr.run_transient(
-                "web",
-                ["python", "manage.py", "collectstatic", "--noinput"],
-                stream=True,
-                on_line=reporter.on_build_output,
-                log_file=deploy_log_file,
-            )
-        except CommandError as cs_exc:
-            logger.warn(f"Collectstatic warning or skip: {cs_exc.message}")
+        if config.deployment.framework == FrameworkType.DJANGO:
+            logger.info("Executing collectstatic: python manage.py collectstatic --noinput")
+            try:
+                compose_mgr.run_transient(
+                    "web",
+                    ["python", "manage.py", "collectstatic", "--noinput"],
+                    stream=True,
+                    on_line=reporter.on_build_output,
+                    log_file=deploy_log_file,
+                )
+            except CommandError as cs_exc:
+                logger.warn(f"Collectstatic warning or skip: {cs_exc.message}")
 
         # Stage 11: Start main web application
         reporter.start_stage(11, "Starting application containers")
         logger.info("Starting web container: docker compose up -d web")
         compose_mgr.up(services=["web"])
+        current_state.record_event("services", "success", "Application containers started")
+        state_mgr.save_state(current_state)
 
-        # Stage 12: Health check & state persistence (Requirements 9, 10, 40, 48, 49)
+        # Stage 12: Health check & state persistence
         reporter.start_stage(12, "Performing application health check")
 
         health_ok = True
@@ -525,7 +812,7 @@ def run_deployment(
         final_status = DeploymentStatus.HEALTHY if health_ok else DeploymentStatus.UNHEALTHY
         final_health = HealthStatus.HEALTHY if health_ok else HealthStatus.UNHEALTHY
 
-        # Extract root exception if health check failed (Requirements 10, 48, 49)
+        # Extract root exception if health check failed
         parsed_exc = None
         last_err_summary = None
         if not health_ok:
@@ -556,6 +843,35 @@ def run_deployment(
                 panel_lines.append(f"[bold yellow]Full logs:[/bold yellow]\n  [bold cyan]deployx logs {valid_name}[/bold cyan]")
                 console.print(Panel("\n".join(panel_lines), title="Health Check Failure Diagnostics", border_style="red"))
 
+            current_state.record_event("healthcheck", "failed", f"Healthcheck failed: {last_err_summary}")
+            state_mgr.save_state(current_state)
+
+            # Auto-Rollback Workflow
+            should_rollback = auto_rollback if auto_rollback is not None else config.deployment.auto_rollback
+            if should_rollback and prev_commit:
+                if console:
+                    console.print(
+                        f"\n[bold yellow]Auto-Rollback Triggered:[/bold yellow] Reverting to previous healthy commit {prev_commit[:7]}..."
+                    )
+                current_state.record_event("rollback", "started", f"Auto-rollback initiated to {prev_commit[:7]}")
+                state_mgr.save_state(current_state)
+
+                from deployx.deployment.rollback import rollback_project
+                rollback_ok = rollback_project(
+                    valid_name,
+                    build_timeout=effective_build_timeout,
+                    verbose=verbose,
+                    plain=plain,
+                    console=console,
+                )
+                if rollback_ok:
+                    current_state.record_event("rollback", "success", f"Auto-rollback restored {prev_commit[:7]}")
+                    state_mgr.save_state(current_state)
+                else:
+                    current_state.record_event("rollback", "failed", f"Auto-rollback to {prev_commit[:7]} failed")
+                    state_mgr.save_state(current_state)
+
+        # Update state model
         new_state = DeploymentState(
             project=valid_name,
             repository=config.git.repository,
@@ -572,17 +888,35 @@ def run_deployment(
             last_health_response=str(health_details.get("last_status")),
             last_exception_summary=parsed_exc.summary if (not health_ok and parsed_exc) else None,
             detected_runtime_database=detected_runtime_db,
+            detected_framework=detection.framework.value,
+            detected_python_version=detection.infrastructure.selected_python_version,
+            detected_package_manager=detection.infrastructure.package_manager,
+            detected_health_endpoint=detection.infrastructure.health_endpoint,
+            proxy_domain=config.deployment.domain,
+            timeline=current_state.timeline if current_state else [],
         )
-        state_mgr.save_state(new_state)
 
-        # Image tagging on health success (Requirements 27, 39)
+        # Image tagging and proxy configuration on health success
         if health_ok:
+            new_state.record_event("healthcheck", "success", "Healthcheck verified endpoint successfully")
             try:
                 run_command(["docker", "tag", image_tag, f"deployx_{valid_name}:current"], timeout=15, check=False)
                 if prev_image and prev_image != image_tag:
                     run_command(["docker", "tag", prev_image, f"deployx_{valid_name}:previous"], timeout=15, check=False)
+                new_state.record_event("promotion", "success", f"Promoted {image_tag} to current")
             except Exception:
                 pass
+
+            # Reverse proxy integration
+            if config.deployment.domain:
+                try:
+                    proxy = ProxyManager()
+                    proxy.add_or_update_route(valid_name, config.deployment.domain, config.deployment.docker.port)
+                    new_state.record_event("proxy", "success", f"Reverse proxy configured for {config.deployment.domain}")
+                except Exception as p_exc:
+                    logger.warning(f"Proxy configuration notice: {p_exc}")
+
+            state_mgr.save_state(new_state)
 
             logger.info(f"Deployment successfully completed for commit {short_commit}")
             if console:
@@ -599,6 +933,8 @@ def run_deployment(
                     )
                 )
             return True
+
+        state_mgr.save_state(new_state)
         return False
 
     except KeyboardInterrupt:
@@ -609,6 +945,7 @@ def run_deployment(
         fail_state.failed_stage = reporter.current_stage_name
         fail_state.last_error = "Deployment cancelled by user (Ctrl+C)"
         fail_state.updated_at = now_iso
+        fail_state.record_event(reporter.current_stage_name or "deployment", "cancelled", "Cancelled by user")
         state_mgr.save_state(fail_state)
 
         if console:
@@ -626,6 +963,7 @@ def run_deployment(
             fail_state.timeout_reason = exc.message
         fail_state.last_error = str(exc.message)
         fail_state.updated_at = now_iso
+        fail_state.record_event(reporter.current_stage_name or "command", "failed", str(exc.message))
         state_mgr.save_state(fail_state)
 
         logger.error(f"Deployment command failed: {exc}")
@@ -643,6 +981,7 @@ def run_deployment(
         fail_state.failed_stage = reporter.current_stage_name
         fail_state.last_error = str(exc)
         fail_state.updated_at = now_iso
+        fail_state.record_event(reporter.current_stage_name or "deployment", "failed", str(exc))
         state_mgr.save_state(fail_state)
 
         reporter.show_failure_summary(
